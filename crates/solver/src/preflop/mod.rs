@@ -1711,7 +1711,7 @@ impl PreflopSolver {
                         }
                     }
                 }
-                if let (Some(model), true) = (&self.multiway, nd.live.count_ones() >= 3) {
+                if let (Some(model), true) = (&self.multiway, nd.live.count_ones() >= 3 && prob >= 1e-3) {
                     let equities = model.equities(&dists);
                     for h in 0..NUM_CLASSES {
                         out[h] = (prob * (pot_eff * equities[h] - inv_p)) as f32;
@@ -1807,6 +1807,17 @@ impl PreflopSolver {
         mode: u8,
         depth: u32,
     ) -> Vec<f32> {
+        if (mode == 1 || mode == 2) && depth > 0 {
+            let mut prob = 1f64;
+            for q in 0..self.n {
+                if q != p {
+                    prob *= reaches[q].iter().sum::<f32>() as f64;
+                }
+            }
+            if prob < 1e-5 {
+                return vec![0f32; NUM_CLASSES];
+            }
+        }
         let kind = self.nodes[node].kind;
         if kind != KIND_ACTION {
             let mut out = vec![0f32; NUM_CLASSES];
