@@ -1698,6 +1698,15 @@ async fn pf_status(State(state): State<Arc<AppState>>) -> Json<PreflopStatus> {
 #[derive(Deserialize)]
 struct PfPathRequest {
     path: Vec<usize>,
+    #[serde(default)]
+    include_evs: bool,
+    /// With `include_evs`: price each action by best-responding at the actor's
+    /// later decisions instead of following the saved average strategy. Off by
+    /// default: the average-policy value is the action's value at equilibrium,
+    /// while best response overstates any action that leads to more decisions
+    /// until the solve has converged.
+    #[serde(default)]
+    best_response_evs: bool,
 }
 
 // ---- player profiles ----
@@ -2953,6 +2962,11 @@ async fn pf_node(
             result.strategy_note = Some(note);
             result.strategy = None;
             result.exportable = false;
+        }
+        if req.include_evs && result.kind == "action" && result.strategy_note.is_none() {
+            if let Ok(evs) = s.diagnostic_action_evs(&req.path, req.best_response_evs) {
+                result.action_evs = Some(evs.into_iter().flatten().collect());
+            }
         }
         let publication = status.lock().unwrap().publication();
         Ok::<_, String>(PfPublished { result, publication })

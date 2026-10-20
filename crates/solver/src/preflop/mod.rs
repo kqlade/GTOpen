@@ -2154,6 +2154,10 @@ pub struct PreflopNodeView {
     /// Action nodes: the actor's average strategy, na x 169 flattened.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<Vec<f32>>,
+    /// Per-action EVs in bb relative to folding at this node (`actions.len() * 169`),
+    /// populated when `include_evs: true` is requested on `/api/preflop/node`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_evs: Option<Vec<f64>>,
     /// Fraction of each class's combos still in the actor's range (0..1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<Vec<f32>>,
@@ -2333,6 +2337,7 @@ impl PreflopSolver {
             } else { None },
             contextual_prediction: self.contextual_status(node),
             strategy: if strategy_note.is_none() {strategy} else {None},
+            action_evs: None,
             strategy_note,
             kind,
             actor,
