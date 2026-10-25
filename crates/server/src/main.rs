@@ -1206,6 +1206,20 @@ async fn pf_estimate(
     })))
 }
 
+/// Solve one multiway flop (three or more seats) and return every seat's
+/// per-class values: the measuring tool behind the preflop engine's multiway
+/// leaf values (docs/multiway_flop_solver.md). Synchronous and stateless;
+/// several can run at once, one thread each.
+async fn multiway_flop_solve(
+    Json(req): Json<solver::multiway_flop::SolveRequest>,
+) -> Result<Json<solver::multiway_flop::SolveResult>, ApiError> {
+    let res = tokio::task::spawn_blocking(move || solver::multiway_flop::solve(&req))
+        .await
+        .map_err(|e| bad_request(e.to_string()))?
+        .map_err(bad_request)?;
+    Ok(Json(res))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PfSolveRequest {
@@ -3568,6 +3582,7 @@ async fn main() {
         .route("/api/load", post(load_solve))
         .route("/api/saves", get(list_saves))
         .route("/api/presets", get(get_presets))
+        .route("/api/multiway-flop/solve", post(multiway_flop_solve))
         .route("/api/preflop/spot", post(pf_build))
         .route("/api/preflop/estimate", post(pf_estimate))
         .route("/api/preflop/solve", post(pf_solve))

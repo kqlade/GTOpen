@@ -15,6 +15,7 @@ pub mod evaluator;
 pub mod game;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod multiway_flop;
 pub mod preflop;
 pub mod query;
 pub mod range;
