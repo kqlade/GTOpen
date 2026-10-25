@@ -69,7 +69,7 @@ You can start directly in Setup if you already have ranges. Preflop Lab is optio
 
 **Preflop rake:** new scenarios use **Balanced (approx.)**, which splits one pot between the heads-up players and deducts your configured rake explicitly. Set rake to `0` for no rake; with positive rake, a cap of `0` means uncapped. Old saves retain their old model. [How the approximation works](docs/preflop_balanced_model.md).
 
-**Measured flop values:** the preflop solver can price its heads-up flop terminals with values the postflop solver measured (`POST /api/preflop/leaf-values`), instead of the equity-realization approximation, which overpays medium hands for calling raises. Such games solve on the CPU and save as v5. [How the table is measured and installed](docs/measured_flop_values.md).
+**Measured flop values:** the preflop solver can price its flop terminals with measured values (`POST /api/preflop/leaf-values`) instead of the equity-realization approximation, which overpays medium hands for calling raises: heads-up terminals from the postflop solver, multiway ones from the multiway flop solver (`POST /api/multiway-flop/solve`, a one-street CFR over three or more seats with exact showdowns on sampled runouts). Such games solve on the CPU and save as v5. [How the table is measured and installed](docs/measured_flop_values.md) · [The multiway flop solver](docs/multiway_flop_solver.md).
 
 ### Preflop and player models
 

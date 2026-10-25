@@ -172,8 +172,8 @@ impl PreflopSolver {
         for t in &file.terminals {
             let node = self.node_at(&t.path)?;
             let nd: &PNode = &self.nodes[node];
-            if nd.kind != KIND_POT_SHARE || nd.live.count_ones() != 2 {
-                return Err(format!("path {:?} is not a heads-up flop terminal", t.path));
+            if nd.kind != KIND_POT_SHARE || nd.live.count_ones() < 2 {
+                return Err(format!("path {:?} is not a flop terminal", t.path));
             }
             let mut per_seat = vec![Vec::new(); self.n];
             for seat in 0..self.n {
@@ -347,7 +347,7 @@ mod tests {
         let mut s = fixture();
         let path = hu_flop_path(&s);
         let err = s.set_leaf_values(Some(file(vec![], 1.0, 1.0))).unwrap_err();
-        assert!(err.contains("not a heads-up flop terminal"), "{err}");
+        assert!(err.contains("not a flop terminal"), "{err}");
         let mut f = file(path.clone(), 1.0, 1.0);
         f.terminals[0].values.insert("SB".into(), vec![0.0; NUM_CLASSES]);
         let err = s.set_leaf_values(Some(f)).unwrap_err();
@@ -363,6 +363,37 @@ mod tests {
         f.terminals.push(f.terminals[0].clone());
         assert!(s.set_leaf_values(Some(f)).unwrap_err().contains("appears twice"));
         assert!(s.leaf_values().is_none(), "a rejected table must not be installed");
+    }
+
+    /// BTN raises, SB calls, BB calls: a three-way flop. A covered one pays
+    /// every live seat its measured value less its investment, ahead of the
+    /// coupled-deck equity model; the table must name all three seats.
+    #[test]
+    fn covered_multiway_terminals_pay_every_seat_its_measured_value() {
+        let mut s = fixture();
+        let root = &s.nodes[0];
+        let raise = root.actions.iter().position(|a| a.kind == "raise").unwrap();
+        let sb = s.node_at(&[raise]).unwrap();
+        let call = s.nodes[sb].actions.iter().position(|a| a.kind == "call").unwrap();
+        let bb = s.node_at(&[raise, call]).unwrap();
+        let call2 = s.nodes[bb].actions.iter().position(|a| a.kind == "call").unwrap();
+        let path = vec![raise, call, call2];
+        let node = s.node_at(&path).unwrap();
+        assert_eq!((s.nodes[node].kind, s.nodes[node].live.count_ones()), (KIND_POT_SHARE, 3));
+        let mut f = file(path.clone(), 3.0, 2.0);
+        let err = s.set_leaf_values(Some(f.clone())).unwrap_err();
+        assert!(err.contains("no values for SB"), "{err}");
+        f.terminals[0].values.insert("SB".into(), vec![1.5; NUM_CLASSES]);
+        s.set_leaf_values(Some(f)).unwrap();
+        assert!(s.leaf_values().unwrap().covers(node));
+        let reaches: Vec<Vec<f32>> = (0..3).map(|_| vec![1.0; NUM_CLASSES]).collect();
+        let prob = (NUM_CLASSES * NUM_CLASSES) as f32;
+        let mut out = vec![0f32; NUM_CLASSES];
+        for (seat, value) in [(0usize, 2.0f32), (1, 1.5), (2, 3.0)] {
+            s.terminal_value(node, seat, &reaches, &mut out);
+            let expected = prob * (value - s.nodes[node].invested[seat] as f32);
+            assert!(out.iter().all(|v| (v - expected).abs() < 1e-2), "seat {seat}: {} vs {expected}", out[0]);
+        }
     }
 
     #[test]

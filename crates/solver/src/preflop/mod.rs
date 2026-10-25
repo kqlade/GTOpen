@@ -1761,6 +1761,16 @@ impl PreflopSolver {
                     }
                     return;
                 }
+                // Measured by the postflop solvers (leaf.rs): chips collected
+                // from the flop on, future bets and rake inside — heads-up
+                // and multiway alike.
+                if let Some(values) = self.leaf.as_ref().and_then(|l| l.values(node)) {
+                    let v = &values[p];
+                    for h in 0..NUM_CLASSES {
+                        out[h] = (others[h] * (v[h] as f64 - inv_p)) as f32;
+                    }
+                    return;
+                }
                 if let (Some(model), true) = (&self.multiway, nd.live.count_ones() >= 3 && prob >= 1e-3) {
                     // The coupled-deck model takes range distributions, not
                     // per-class ones; removal shapes the reach, not the shares.
@@ -1783,15 +1793,8 @@ impl PreflopSolver {
                     values
                 }).collect();
                 if nd.live.count_ones() == 2 {
-                    // Measured by the postflop solver: chips collected from the
-                    // flop on, future bets and rake inside (leaf.rs).
-                    if let Some(values) = self.leaf.as_ref().and_then(|l| l.values(node)) {
-                        let v = &values[p];
-                        for h in 0..NUM_CLASSES {
-                            out[h] = (others[h] * (v[h] as f64 - inv_p)) as f32;
-                        }
-                        return;
-                    }
+                    // Heads-up terminals the table does not cover: the
+                    // realization it measured over the covered ones.
                     if let Some(ratio) = self.leaf_fallback(node, p) {
                         for h in 0..NUM_CLASSES {
                             out[h] = (others[h] * (pot_eff * equities[0][h] as f64 * ratio as f64 - inv_p)) as f32;

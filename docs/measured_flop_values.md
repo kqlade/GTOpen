@@ -43,19 +43,24 @@ prices a covered terminal for seat `p` as
 
 which is exactly where the model put `pot_eff × share[h] − invested[p]`.
 
+A terminal may have any number of live seats: heads-up values come from the
+postflop solver, multiway ones (three or more seats) from the multiway flop
+solver (`docs/multiway_flop_solver.md`); every live position must be present.
+
 Heads-up terminals the table does not cover (below the measuring run's reach
 cutoff) are priced with the `fallback` realization measured over the covered
 ones: equity against the opponent's arriving range × the raked pot × the cell
 for the seat's role (first to act on the flop = "oop"), whether it was the
 last preflop raiser, and SPR (the cell with the smallest `spr_max` at or above
 the terminal's SPR; above every edge, the largest). All-in terminals keep raw
-equity (no flop to play); multiway terminals keep the coupled-deck model.
+equity (no flop to play); uncovered multiway terminals keep the coupled-deck
+equity model.
 
 ## Engine, saves, API
 
 - `PreflopSolver::set_leaf_values(Option<LeafValuesFile>)` validates every path
-  (a heads-up `POT_SHARE` node, both live positions present, 169 finite
-  values, no duplicates) and installs or clears the table. Payoffs change, so
+  (a `POT_SHARE` node with two or more live seats, every live position
+  present, 169 finite values, no duplicates) and installs or clears the table. Payoffs change, so
   it restarts learning (`reset_learning`), like a table change does.
 - `terminal_value` consults the table before the realization models;
   `continuation()` reports `model: "measured"` / `"measured_fallback"`.
@@ -77,9 +82,10 @@ The values depend on the ranges that reach each terminal, and those ranges
 move with the strategy the values produce. So the table is a fixed point:
 
 1. Solve preflop (round 0: the equity-realization model).
-2. For every heads-up flop terminal the solve reaches, send both arriving
-   ranges (with the floor) to the postflop solver on K sampled flops; average
-   the root EVs per class; write the table. A fixed, systematic sample over the
+2. For every flop terminal the solve reaches, send the arriving ranges (with
+   the floor) to the postflop solver (heads-up) or the multiway flop solver
+   (three or more seats) on K sampled flops; average the root EVs per class;
+   write the table. A fixed, systematic sample over the
    1,755 suit-isomorphic flops, shared by all terminals and rounds, keeps the
    rounds comparable (common random numbers).
 3. Install the table, re-solve preflop, compare the strategy with the previous
@@ -109,5 +115,6 @@ opponents themselves stays unmodelled.
 - The measuring tree is smaller than a full postflop game (one bet size per
   street with raises, leads and jams); values are a touch low for the
   aggressor relative to a wide sizing menu.
-- Only heads-up terminals are measured. Multiway flops keep the coupled-deck
-  equity model.
+- Multiway terminals are measured with a one-street tree and check-down
+  leaves (`docs/multiway_flop_solver.md`): the flop betting is real, the turn
+  and river are not.

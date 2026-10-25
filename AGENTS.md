@@ -92,11 +92,14 @@ bleed and never converges — drops below `target_gap`), `status`
 `realization_note` is non-empty when "calibrated" could not load its fit and
 the HU game was priced with the static model; `multiway_equity_model` identifies
 the active continuation version; `leaf_values` names the measured flop-value
-table pricing the HU flop terminals, or null — see `docs/measured_flop_values.md`
-and `leaf-values` `{...table...}` | `null`, which installs or clears one and
-restarts learning; config `card_removal: true` weights every other seat's
-reach by the hero's cards, `crates/solver/src/preflop/removal.rs` — both are
-CPU-only and save as v5), `session` (GET: the live game —
+table pricing the flop terminals (heads-up and multiway), or null — see
+`docs/measured_flop_values.md` and `leaf-values` `{...table...}` | `null`,
+which installs or clears one and restarts learning; config `card_removal:
+true` weights every other seat's reach by the hero's cards,
+`crates/solver/src/preflop/removal.rs` — both are CPU-only and save as v5;
+multiway values come from `POST /api/multiway-flop/solve`, the stateless
+three-plus-seat flop solver in `crates/solver/src/multiway_flop/`, see
+`docs/multiway_flop_solver.md`), `session` (GET: the live game —
 config, seats, iteration, hero/frozen, state), `stop`,
 `node` `{"path":[i,j,...]}` (action indices; returns actor, actions+freqs,
 `strategy` as na×169 action-major flat array, per-class reach), `generate`
