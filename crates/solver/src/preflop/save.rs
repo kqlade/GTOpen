@@ -5,7 +5,7 @@
 //! must produce identical arena sizes (the builder is deterministic).
 
 use super::equity::{EquityTable, NUM_CLASSES};
-use super::{PreflopConfig, PreflopSolver, SeatProfile, KIND_ACTION};
+use super::{LeafValuesFile, PreflopConfig, PreflopSolver, SeatProfile, KIND_ACTION};
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
@@ -16,6 +16,9 @@ const MAGIC_LEGACY: &[u8] = b"GTOPREFLOP1\n";
 const MAGIC_COUPLED_DECK: &[u8] = b"GTOPREFLOP2\n";
 const MAGIC_BALANCED: &[u8] = b"GTOPREFLOP4\n";
 const MAGIC_STRADDLE: &[u8] = b"GTOPREFLOP3\n";
+// Arenas learned against measured flop values (leaf.rs): an older binary
+// must refuse them rather than continue the solve against the model payoffs.
+const MAGIC_LEAVES: &[u8] = b"GTOPREFLOP5\n";
 
 fn legacy_multiway_equity_model() -> String {
     "legacy_product".into()
@@ -41,6 +44,9 @@ struct Header {
     /// older readers simply never read past the arenas).
     #[serde(default)]
     hero_backup: Option<(usize, u32)>,
+    /// The measured flop values the arenas were learned against (v5 saves).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    leaf_values: Option<LeafValuesFile>,
 }
 
 fn write_slice(w: &mut BufWriter<std::fs::File>, slice: &[f32]) -> Result<(), String> {
@@ -150,7 +156,9 @@ impl PreflopSolver {
     fn write_game(&self, path: &str) -> Result<(), String> {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut w = BufWriter::new(file);
-        let magic = if self.cfg.realization == "balanced" || self.cfg.fourbet_mults.is_some() || self.cfg.fourbet_mults_by_seat.is_some() {
+        let magic = if self.leaf.is_some() {
+            MAGIC_LEAVES
+        } else if self.cfg.realization == "balanced" || self.cfg.fourbet_mults.is_some() || self.cfg.fourbet_mults_by_seat.is_some() {
             MAGIC_BALANCED
         } else if self.cfg.utg_straddle {
             MAGIC_STRADDLE
@@ -170,6 +178,7 @@ impl PreflopSolver {
             hero: self.hero,
             pre_hero_frozen: self.pre_hero_frozen.clone(),
             hero_backup: self.hero_backup_meta(),
+            leaf_values: self.leaf.as_ref().map(|l| l.file.clone()),
         };
         let hjson = serde_json::to_string(&header).map_err(|e| e.to_string())?;
         w.write_all(hjson.as_bytes()).map_err(|e| e.to_string())?;
@@ -194,7 +203,7 @@ impl PreflopSolver {
         let mut r = BufReader::new(file);
         let mut magic = [0u8; 12];
         r.read_exact(&mut magic).map_err(|e| e.to_string())?;
-        if magic != MAGIC_LEGACY && magic != MAGIC_COUPLED_DECK && magic != MAGIC_STRADDLE && magic != MAGIC_BALANCED {
+        if magic != MAGIC_LEGACY && magic != MAGIC_COUPLED_DECK && magic != MAGIC_STRADDLE && magic != MAGIC_BALANCED && magic != MAGIC_LEAVES {
             return Err("not a preflop game save".to_string());
         }
         let mut line = Vec::new();
@@ -209,18 +218,23 @@ impl PreflopSolver {
         // V1 predates explicit model provenance; V2 must never silently
         // substitute that default when its required provenance is missing.
         let raw_header: serde_json::Value = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-        if (magic == MAGIC_COUPLED_DECK || magic == MAGIC_STRADDLE || magic == MAGIC_BALANCED) && raw_header.get("multiway_equity_model").is_none() {
+        if (magic == MAGIC_COUPLED_DECK || magic == MAGIC_STRADDLE || magic == MAGIC_BALANCED || magic == MAGIC_LEAVES) && raw_header.get("multiway_equity_model").is_none() {
             return Err("preflop v2 save is missing its multiway equity model".into());
         }
-        if magic == MAGIC_BALANCED && raw_header.get("config").and_then(|c| c.get("realization")).is_none() {
+        if (magic == MAGIC_BALANCED || magic == MAGIC_LEAVES) && raw_header.get("config").and_then(|c| c.get("realization")).is_none() {
             return Err("preflop v4 save is missing its heads-up realization model".into());
         }
+        if (magic == MAGIC_LEAVES) != raw_header.get("leaf_values").is_some_and(|v| !v.is_null()) {
+            return Err("preflop v5 saves carry measured flop values, and only they do".into());
+        }
         let header: Header = serde_json::from_value(raw_header).map_err(|e| e.to_string())?;
-        if magic != MAGIC_BALANCED && (magic==MAGIC_STRADDLE)!=header.config.utg_straddle {
+        if magic != MAGIC_BALANCED && magic != MAGIC_LEAVES && (magic==MAGIC_STRADDLE)!=header.config.utg_straddle {
             return Err("UTG straddle saves require preflop v3 format and explicit straddle metadata".into());
         }
         let mut s = PreflopSolver::new(header.config.clone(), eq)?;
         s.set_multiway_equity_model(&header.multiway_equity_model)?;
+        // Before the arenas: installing the table restarts learning.
+        s.set_leaf_values(header.leaf_values.clone())?;
         // Refuse malformed session state here, while nothing depends on it:
         // installed unchecked it would panic at the first query instead.
         validate_header(&s, &header)?;
@@ -330,5 +344,50 @@ mod tests {
         rewrite_model(path, Some("unknown_future_model"));
         assert!(PreflopSolver::load_game(path, original.eq.clone()).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn measured_flop_values_travel_with_the_save_as_v5() {
+        use super::super::{LeafTerminalFile, LeafValuesFile};
+        let mut original = fixture();
+        // BTN raises... the fixture's 2bb stacks make every raise a jam, so
+        // find a heads-up flop terminal by search instead of by line.
+        let flop = (0..original.nodes.len())
+            .find(|&i| original.nodes[i].kind == super::super::KIND_POT_SHARE && original.nodes[i].live.count_ones() == 2)
+            .expect("a heads-up flop terminal");
+        let path = original.path_to(flop);
+        let live: Vec<String> = (0..3).filter(|&s| original.nodes[flop].live & (1 << s) != 0)
+            .map(|s| original.cfg.positions[s].clone()).collect();
+        let file = LeafValuesFile {
+            name: "roundtrip".into(),
+            source: serde_json::json!({"flops": 2}),
+            terminals: vec![LeafTerminalFile {
+                path: path.clone(),
+                values: live.iter().enumerate().map(|(i, p)| (p.clone(), vec![0.5 + i as f32; NUM_CLASSES])).collect(),
+            }],
+            fallback: vec![super::super::LeafFallbackCell { role: "oop".into(), aggressor: false, spr_max: 5.0, ratio: 0.75 }],
+        };
+        original.set_leaf_values(Some(file)).unwrap();
+        original.iteration = 9;
+        unsafe { original.regrets.slice_mut()[0] = 2.5; }
+        let path_s = std::env::temp_dir().join(format!("gtopen-leaf-save-{}.gtop", std::process::id()));
+        let path_s = path_s.to_str().unwrap();
+        original.save_game(path_s).unwrap();
+        let saved = std::fs::read(path_s).unwrap();
+        assert_eq!(&saved[..MAGIC_LEAVES.len()], MAGIC_LEAVES);
+        let loaded = PreflopSolver::load_game(path_s, original.eq.clone()).unwrap();
+        let lv = loaded.leaf_values().expect("table restored");
+        assert_eq!(lv.file.name, "roundtrip");
+        assert!(lv.covers(flop));
+        assert_eq!(lv.fallback_ratio(true, false, 1.0), Some(0.75));
+        assert_eq!(loaded.iteration, 9, "the table is installed before the arenas, so learning is kept");
+        unsafe { assert_eq!(loaded.regrets.slice()[0], 2.5); }
+        // the same bytes under the v4 magic claim a model they were not learned against
+        let mut forged = saved.clone();
+        forged[..MAGIC_BALANCED.len()].copy_from_slice(MAGIC_BALANCED);
+        std::fs::write(path_s, &forged).unwrap();
+        let err = PreflopSolver::load_game(path_s, original.eq.clone()).err().expect("v4 magic over a v5 header is refused");
+        assert!(err.contains("v5"), "{err}");
+        std::fs::remove_file(path_s).unwrap();
     }
 }

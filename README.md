@@ -69,6 +69,8 @@ You can start directly in Setup if you already have ranges. Preflop Lab is optio
 
 **Preflop rake:** new scenarios use **Balanced (approx.)**, which splits one pot between the heads-up players and deducts your configured rake explicitly. Set rake to `0` for no rake; with positive rake, a cap of `0` means uncapped. Old saves retain their old model. [How the approximation works](docs/preflop_balanced_model.md).
 
+**Measured flop values:** the preflop solver can price its heads-up flop terminals with values the postflop solver measured (`POST /api/preflop/leaf-values`), instead of the equity-realization approximation, which overpays medium hands for calling raises. Such games solve on the CPU and save as v5. [How the table is measured and installed](docs/measured_flop_values.md).
+
 ### Preflop and player models
 
 For a normal live straddle, enable **UTG straddle** in Preflop Lab and enter its size (default **2 bb**, tables of 3–9 players). The next seat acts first and the straddler keeps the final check/raise option. All sizes stay in the original big blind: a 2 bb straddle needs an ordinary opening raise of at least 4 bb. Save the setting with your scenario or game. [Straddle rules and model limitations](docs/utg-straddles.md).

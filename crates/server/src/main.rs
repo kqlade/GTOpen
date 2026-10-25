@@ -185,6 +185,10 @@ struct PreflopStatus {
     /// Versioned multiway payoff model; saved games retain their original model.
     #[serde(default)]
     multiway_equity_model: String,
+    /// The measured flop values pricing this game's heads-up flop terminals
+    /// (null: the equity-realization model). See solver/preflop/leaf.rs.
+    #[serde(default)]
+    leaf_values: Option<solver::preflop::LeafValuesSummary>,
 }
 
 struct Session {
@@ -1777,6 +1781,30 @@ async fn pf_table(
     Ok(Json(serde_json::json!({"ok": true, "overrides": overrides})))
 }
 
+/// Install (or, with a JSON `null` body, clear) the measured flop values that
+/// price the game's heads-up flop terminals. Payoffs change, so learning
+/// restarts; a solve then runs on the CPU (the GPU kernels price terminals
+/// with the equity-realization model, see leaf.rs).
+async fn pf_leaf_values(
+    State(state): State<Arc<AppState>>,
+    Json(file): Json<Option<solver::preflop::LeafValuesFile>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (solver, _, status) = pf_session(&state)?;
+    let summary = tokio::task::spawn_blocking(move || {
+        let mut s = pf_solver_lock(&solver);
+        pf_reject_if_running(&status)?;
+        let summary = s.set_leaf_values(file).map_err(bad_request)?;
+        let mut st = status.lock().unwrap();
+        st.invalidate_accuracy(s.iteration);
+        st.state = "idle".into();
+        st.leaf_values = summary.clone();
+        Ok::<_, ApiError>(summary)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))??;
+    Ok(Json(serde_json::json!({"ok": true, "leaf_values": summary})))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PfGenerateRequest {
@@ -1988,6 +2016,7 @@ async fn pf_load_game(
         "arena_mb": loaded.arena_mb(),
         "iteration": loaded.iteration,
         "seats": seats,
+        "leaf_values": loaded.leaf_values().map(|l| l.summary()),
     });
     let status = PreflopStatus {
         state: "stopped".into(),
@@ -1997,6 +2026,7 @@ async fn pf_load_game(
         frozen: loaded.seat_frozen.clone(),
         realization_note: loaded.realization_note.clone(),
         multiway_equity_model: loaded.multiway_equity_model().into(),
+        leaf_values: loaded.leaf_values().map(|l| l.summary()),
         ..Default::default()
     };
     pf_install_session(
@@ -2043,6 +2073,7 @@ async fn pf_session_info(
             "frozen": s.seat_frozen,
             "realization_note": s.realization_note,
             "multiway_equity_model": s.multiway_equity_model(),
+            "leaf_values": s.leaf_values().map(|l| l.summary()),
             "state": st.state,
         })
     })
@@ -3548,6 +3579,8 @@ async fn main() {
         .route("/api/preflop/export", post(pf_export))
         // Nine empirical profiles can legitimately exceed Axum's 2 MiB default.
         .route("/api/preflop/table", post(pf_table).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)))
+        // ~200 terminals × 2 seats × 169 values: a few MB of JSON.
+        .route("/api/preflop/leaf-values", post(pf_leaf_values).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)))
         .route("/api/preflop/generate", post(pf_generate).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/preflop/contextual-preview", post(pf_contextual_preview))
         .route("/api/preflop/model-evidence", post(pf_model_evidence).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))

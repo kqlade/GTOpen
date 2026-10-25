@@ -91,7 +91,10 @@ bleed and never converges — drops below `target_gap`), `status`
 (state/iteration/per-seat `gaps`+`evs` in bb/hand/`hero`/`frozen`;
 `realization_note` is non-empty when "calibrated" could not load its fit and
 the HU game was priced with the static model; `multiway_equity_model` identifies
-the active continuation version), `session` (GET: the live game —
+the active continuation version; `leaf_values` names the measured flop-value
+table pricing the HU flop terminals, or null — see `docs/measured_flop_values.md`
+and `leaf-values` `{...table...}` | `null`, which installs or clears one and
+restarts learning), `session` (GET: the live game —
 config, seats, iteration, hero/frozen, state), `stop`,
 `node` `{"path":[i,j,...]}` (action indices; returns actor, actions+freqs,
 `strategy` as na×169 action-major flat array, per-class reach), `generate`

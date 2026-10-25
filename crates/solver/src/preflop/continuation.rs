@@ -74,8 +74,11 @@ impl PreflopSolver {
         let left = live.iter().map(|&p| self.cfg.stack - nd.invested[p] + self.cfg.ante)
             .fold(f64::INFINITY, f64::min).max(0.0);
         let all_in = left / nd.pot <= 1e-9;
-        let calibrated = self.fit.is_some() && !all_in && self.cfg.realization == "calibrated";
-        let model = if all_in { "all_in_equity" } else if calibrated { "calibrated" }
+        let measured = !all_in && self.leaf_values().is_some_and(|l| l.covers(node));
+        let measured_fallback = !all_in && !measured && self.leaf_fallback(node, live[0]).is_some();
+        let calibrated = self.fit.is_some() && !all_in && !measured && !measured_fallback && self.cfg.realization == "calibrated";
+        let model = if all_in { "all_in_equity" } else if measured { "measured" }
+            else if measured_fallback { "measured_fallback" } else if calibrated { "calibrated" }
             else if self.cfg.realization == "balanced" { "balanced" }
             else if self.cfg.realization == "raw" { "raw" } else { "static" };
         let mut players = Vec::with_capacity(2);
@@ -93,7 +96,11 @@ impl PreflopSolver {
             });
         }
         let total_value_bb = players.iter().map(|p| p.value_bb).sum::<f64>();
-        let note = if calibrated {
+        let note = if measured {
+            "Measured by the postflop solver: each hand's expected chips from the flop on, averaged over sampled flops against the ranges that reached here, with future betting and its rake inside. The unallocated amount is the rake paid plus flop-sampling noise."
+        } else if measured_fallback {
+            "This terminal was not measured; it is priced with the realization ratios measured over the covered terminals for the same seat role, initiative and SPR band, applied to equity and the pot after rake. Future betting is not solved here."
+        } else if calibrated {
             "The calibrated model embeds its training rake; this heads-up continuation does not respond to the requested rake. The unallocated amount combines embedded rake and model error, so it is not an expected-rake estimate. Send to postflop setup to solve a selected board with the requested rake."
         } else if model == "balanced" {
             "Relative hand values divide one pot, with requested rake deducted once from the starting pot. Historical calibration supplies relative hand weights only; this is not a retrained rake-free postflop model. Future betting and its rake are not solved."

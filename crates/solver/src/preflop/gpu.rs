@@ -868,6 +868,12 @@ impl PreflopGpu {
     }
 
     fn new_with_kernel_offsets(s: &PreflopSolver, budget_mb: u64, allow_compact: bool, force_minimal: bool, cohorts: bool, unrolled: bool, _cohort_limit_mb: Option<u64>, _narrow: bool) -> Result<Self, String> {
+        // The kernels price terminals with the equity-realization model; a
+        // game with measured flop values (leaf.rs) would learn the wrong
+        // payoffs here. The server's CPU fallback reports the reason.
+        if s.leaf_values().is_some() {
+            return Err("measured flop values are priced on the CPU only".into());
+        }
         let reach_blocks = s.nodes.len().checked_add(s.n - 1)
             .filter(|&len| len <= u32::MAX as usize)
             .ok_or_else(|| "reach table beyond 32-bit block indexing; solving on CPU".to_string())?;

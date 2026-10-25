@@ -20,6 +20,8 @@ pub mod contextual;
 pub mod evidence;
 mod continuation;
 pub use continuation::{ContinuationEstimate, ContinuationPlayerValue};
+mod leaf;
+pub use leaf::{LeafFallbackCell, LeafTerminalFile, LeafValues, LeafValuesFile, LeafValuesSummary};
 mod save;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -639,6 +641,9 @@ pub struct PreflopSolver {
     pub prune: bool,
     /// Loaded for calibrated or balanced; fallbacks preserve each model's semantics.
     pub fit: Option<Arc<RealizationFit>>,
+    /// Flop values measured by the postflop solver; where set they price the
+    /// heads-up flop terminals ahead of `fit` (see leaf.rs).
+    leaf: Option<LeafValues>,
     /// Frozen seats play their current average strategy and stop adapting.
     pub seat_frozen: Vec<bool>,
     /// Ruled seats play their profile in covered buckets.
@@ -728,6 +733,7 @@ impl PreflopSolver {
             iteration: 0,
             prune: std::env::var("PREFLOP_PRUNE").map(|v| v != "0").unwrap_or(true),
             fit,
+            leaf: None,
             seat_frozen: vec![false; n],
             seat_profiles: vec![None; n],
             hero: None,
@@ -1717,6 +1723,25 @@ impl PreflopSolver {
                         out[h] = (prob * (pot_eff * equities[h] - inv_p)) as f32;
                     }
                     return;
+                }
+                if nd.live.count_ones() == 2 {
+                    // Measured by the postflop solver: chips collected from the
+                    // flop on, future bets and rake inside (leaf.rs).
+                    if let Some(values) = self.leaf.as_ref().and_then(|l| l.values(node)) {
+                        let v = &values[p];
+                        for h in 0..NUM_CLASSES {
+                            out[h] = (prob * (v[h] as f64 - inv_p)) as f32;
+                        }
+                        return;
+                    }
+                    if let Some(ratio) = self.leaf_fallback(node, p) {
+                        let mut values = [0.0f32; NUM_CLASSES];
+                        self.eq.eqs_vs_dist(&dists[0], &mut values);
+                        for h in 0..NUM_CLASSES {
+                            out[h] = (prob * (pot_eff * values[h] as f64 * ratio as f64 - inv_p)) as f32;
+                        }
+                        return;
+                    }
                 }
                 if self.cfg.realization == "balanced" && nd.live.count_ones() == 2 {
                     let w = nd.r[p];
