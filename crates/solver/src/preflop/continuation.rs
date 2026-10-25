@@ -29,8 +29,8 @@ pub struct ContinuationEstimate {
 impl PreflopSolver {
     /// Read-only one-action deviations. By default, use the saved average
     /// strategy at every later decision. Values are in original bb relative
-    /// to folding here, conditioned on opponents reaching this node. This
-    /// uses the existing model, without a physical card-removal correction.
+    /// to folding here, conditioned on opponents reaching this node (with
+    /// card removal, conditioned per hero class, as the payoffs are).
     /// `best_response` optimizes only the acting player's later decisions;
     /// opponents keep their saved policies. Useful for unused branches where
     /// the hero's average continuation may be poorly accumulated.
@@ -45,15 +45,37 @@ impl PreflopSolver {
             if !mass.is_finite() || mass <= 0.0 { return Err("unreachable node".into()); }
             for v in r { *v /= mass; }
         }
-        let mass: f64 = reaches.iter().enumerate().filter(|(q,_)| *q != p)
-            .map(|(_,r)| r.iter().sum::<f32>() as f64).product();
+        let mass = self.others_mass(p, &reaches);
         let mut result = Vec::new();
         for a in 0..nd.actions.len() {
             let values = self.traverse(self.child(node,a),p,&mut reaches.clone(),if best_response {2} else {1},0);
             if self.stop_requested() { return Err("evaluation cancelled".into()); }
-            result.push(values.into_iter().map(|v| v as f64 / mass + nd.invested[p]).collect());
+            result.push(values.into_iter().zip(mass.iter()).map(|(v, m)| v as f64 / m + nd.invested[p]).collect());
         }
         Ok(result)
+    }
+
+    /// Everyone else's reaching mass, per hero class: one number for all
+    /// classes without card removal; with it, weighted by the cards the
+    /// hero's class removes from the deck (what terminal_value multiplies by).
+    pub(crate) fn others_mass(&self, p: usize, reaches: &[Vec<f32>]) -> [f64; NUM_CLASSES] {
+        let mut mass = [1f64; NUM_CLASSES];
+        match &self.removal {
+            Some(removal) => {
+                for (q, reach) in reaches.iter().enumerate() {
+                    if q == p { continue; }
+                    let (mut m, mut eq) = ([0f32; NUM_CLASSES], [0f32; NUM_CLASSES]);
+                    removal.masses(reach, &mut m, &mut eq);
+                    for h in 0..NUM_CLASSES { mass[h] *= m[h] as f64; }
+                }
+            }
+            None => {
+                let scalar: f64 = reaches.iter().enumerate().filter(|(q, _)| *q != p)
+                    .map(|(_, r)| r.iter().sum::<f32>() as f64).product();
+                mass.fill(scalar);
+            }
+        }
+        mass
     }
 
     pub(super) fn continuation_estimate(
@@ -85,10 +107,9 @@ impl PreflopSolver {
         for p in live {
             let mut values = [0.0; NUM_CLASSES];
             self.terminal_value(node, p, &normalized, &mut values);
-            let probability: f64 = normalized.iter().enumerate().filter(|(q, _)| *q != p)
-                .map(|(_, r)| r.iter().sum::<f32>() as f64).product();
-            let net: f64 = normalized[p].iter().zip(values)
-                .map(|(&w, v)| w as f64 * v as f64 / probability).sum();
+            let probability = self.others_mass(p, &normalized);
+            let net: f64 = normalized[p].iter().zip(values).zip(probability.iter())
+                .map(|((&w, v), m)| w as f64 * v as f64 / m).sum();
             let own_mass = normalized[p].iter().map(|&w| w as f64).sum::<f64>();
             players.push(ContinuationPlayerValue {
                 position: self.cfg.positions[p].clone(),
