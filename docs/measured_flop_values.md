@@ -115,6 +115,8 @@ opponents themselves stays unmodelled.
 - The measuring tree is smaller than a full postflop game (one bet size per
   street with raises, leads and jams); values are a touch low for the
   aggressor relative to a wide sizing menu.
-- Multiway terminals are measured with a one-street tree and check-down
-  leaves (`docs/multiway_flop_solver.md`): the flop betting is real, the turn
-  and river are not.
+- Multiway terminals are measured with a flop-and-turn tree over sampled,
+  class-weighted turn and river cards (`docs/multiway_flop_solver.md`): the
+  flop and turn betting are real, the river is checked down. The deck is
+  exact three-handed; four-way pots keep the opponents independent of each
+  other.

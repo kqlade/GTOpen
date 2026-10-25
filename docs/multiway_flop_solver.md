@@ -14,30 +14,55 @@ browsing a game tree.
   last bet, so every seat has the same stack behind: no side pots.
 - Hands are the 1,326 two-card combos per seat, weighted by the preflop reach
   of the hand class (the weight every combo of the class takes the line with),
-  minus the combos the board blocks. Card removal between the hero and each
-  opponent is exact; the opponents' cards are treated as independent of each
-  other (a hand both opponents could hold is counted for both). That is the
-  one approximation in the deck model; the overlapping hands it counts are
-  correlated, which lifts every seat's share by about one percent of the pot
-  (three uniform ranges checking down every runout own 2.53 bb each of a
-  7.5 bb pot).
+  minus the combos the board blocks. Card removal is exact in a three-handed
+  pot: no two seats hold the same card, between the hero and each opponent
+  and between the two opponents (`showdown.rs`, `Pair`: the mass of two
+  seats' hand pairs in a category is the product of the two masses, minus the
+  pairs that share a card — a dot product over cards of the per-card masses
+  — plus the pairs that are the same hand). Three uniform ranges checking
+  down every runout own exactly 2.5 bb each of a 7.5 bb pot. With four or
+  more seats the other seats are taken as independent of each other given
+  the hero's cards, which lifts shares by a percent or two of the pot;
+  four-way pots are under half a percent of deals at the preflop terminals.
 - Betting follows the postflop order (blinds first, then seat order). Actions:
   check, bet (pot fractions), fold, call, raise (multiples of the bet faced),
   all-in whenever a size would commit more than `allin_threshold` of the
-  stack, at most `max_raises` raises per street.
+  stack, at most `max_raises` raises per street. The turn has its own sizes
+  (`turn_bet_sizes`, `turn_raise_sizes`, `turn_max_raises`; the flop's when
+  absent, an empty list for check or call only).
 - The tree covers the flop; `turn_cards > 0` adds a turn street on that many
   sampled turn cards (0 keeps the tree one street). Every way the flop
-  betting can close with chips behind grows its own turn subtree per card, so
-  a turn street multiplies the work by a few hundred; it is there for
-  checking the one-street values on a spot, not for measuring.
+  betting can close with chips behind grows its own turn subtree per card,
+  so the turn street's sizes decide the cost: one turn size with one raise
+  on six turn cards is about seventy times the one-street tree.
+- Sampled cards are chosen by texture class, not at random. Every card that
+  can come is classed (`card_class`) as `flush` (its suit then shows three or
+  more times), `pair` (its rank is on the board), `straight` (a five-rank
+  window holds it and two board ranks, so two hole cards make a straight
+  through it), `over` (above every board rank) or `blank`; a sample of `k`
+  cards gives every class present at least one card and the rest in
+  proportion to class size, spread evenly through the class in rank order,
+  and each sampled card carries the share of the deck it stands for
+  (`sample_cards`). Averages over a sample are weighted by those shares, so
+  they estimate the average over the deck while every texture is in the
+  tree. The choice is deterministic: every solve and every calibration round
+  sees the same cards for a flop.
 - Leaves: a fold-out pays the raked pot to the last live seat; a street that
   closes with two or more seats live is checked down, each seat paid its share
-  of the raked pot by exact showdown over a fixed systematic sample of
-  `runouts` board completions (ties split the pot between the tying seats).
+  of the raked pot by exact showdown over the sampled completions (`runouts`
+  class-weighted rivers under a turn card; about `runouts` class-weighted
+  turn × river boards when the flop closes all-in). Ties split the pot
+  between the tying seats. Sampled cards — the turn cards and the runouts —
+  are averaged per hero combo over the cards it does not hold, and each
+  other seat's hands are counted under the cards they do not hold either,
+  which is fewer: the average is scaled by the ratio of the two deck sizes
+  (`sample_weight`, C(47, 2) / C(43, 2) for three seats running the flop out)
+  so that every opponent hand keeps its reach weight. A check-down over every
+  runout then owns exactly the pot, heads-up and three-handed.
   There is no betting after the last modelled street, so hands that want to
-  see every card cheaply are a little overvalued, and the aggressor's barrels
-  are missing. The flop betting itself, position, fold equity and card removal
-  are real.
+  see every card cheaply are a little overvalued on the river, and the
+  river barrels are missing. The flop and turn betting, position, fold
+  equity and card removal are real.
 
 ## Algorithm
 
@@ -45,8 +70,14 @@ Vector-form discounted CFR (α 1.5, β 0, γ 2), alternating updates, every seat
 strategy a 1,326-vector per action node. The showdown leaves sort each
 runout's combos by rank once per solve; per leaf and runout, prefix sums over
 each opponent's reach in rank order (with the two per-card corrections for the
-hero's cards) give every hero combo its chance of beating, or tying, each
-opponent, and the subsets of tying opponents give the share.
+hero's cards) give every hero combo the mass of each opponent's worse, equal
+and compatible hands. With two other seats those masses are also built per
+card (the prefix sums at the hero's rank group, less the hands holding a
+hero card), and the exclusive pair masses — worse-worse, worse-equal,
+equal-equal and so on — come from the inclusion–exclusion above: about
+0.15 µs per hero combo and board, ten times the independent model. With
+three or more other seats the subsets of tying opponents give the share from
+the per-seat masses.
 
 Every `check_every` iterations each seat's best response to the others'
 average strategies is computed; the gap is the sum over seats of
@@ -80,8 +111,9 @@ its own timeout, and several can run at once, one thread each):
            {"position": "BB", "invested": 2.5, "weights": [169 numbers]},
            {"position": "BTN", "invested": 2.5, "weights": [169 numbers]}],
  "bet_sizes": [0.33, 0.75], "raise_sizes": [2.5], "max_raises": 2,
- "allin_threshold": 0.65, "turn_cards": 0, "runouts": 40,
- "iterations": 300, "check_every": 25, "target_gap_pct": 1.0}
+ "turn_bet_sizes": [0.66], "turn_raise_sizes": [2.5], "turn_max_raises": 1,
+ "allin_threshold": 0.65, "turn_cards": 6, "runouts": 8,
+ "iterations": 150, "check_every": 25, "target_gap_pct": 0.5}
 ```
 
 `seats` are in postflop acting order; `pot` includes the folded seats' money;
@@ -91,17 +123,19 @@ carries `values` and `masses` per position (169 each), `range_ev` and
 `best_response_ev` per position, `gap_pct` with its history, `iterations`,
 `nodes`, `seconds` and the first seat's action split at the root.
 
-On the 6-max baseline's BTN-SB-BB single-raised pot (two bet sizes, one raise
-size, two raises, 40 runouts) a flop is 370 nodes and reaches a 0.5% gap in
-75 iterations, about 40 s on one core.
+On the 6-max baseline's BTN-SB-BB single-raised pot the one-street tree (two
+bet sizes, one raise size, two raises, 40 runouts) is 370 nodes and reaches a
+0.5% gap in 75 iterations, about 40 s on one core; with the turn street above
+(six turn cards, eight rivers, one turn size and raise) a flop is 25k nodes
+and an iteration takes about 24 s on one core.
 
 ## Measuring multiway terminals
 
 `scripts/gpu-calibrate.py` in lucky-chances walks the live preflop session for
 `POT_SHARE` terminals with three or more live seats at or above its reach
 cutoff, sends each seat's arriving range (with the floor weight) to this
-solver on the same systematic flop sample the heads-up measurement uses, and
-writes the per-position values into the same `LeafValuesFile`. The preflop
-engine accepts any `POT_SHARE` terminal with chips behind as long as every
-live position is present; uncovered multiway terminals keep the coupled-deck
-equity model.
+solver on the same systematic flop sample the heads-up measurement uses (more
+flops for the terminals that carry more deals), and writes the per-position
+values into the same `LeafValuesFile`. The preflop engine accepts any
+`POT_SHARE` terminal with chips behind as long as every live position is
+present; uncovered multiway terminals keep the coupled-deck equity model.

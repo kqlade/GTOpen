@@ -12,7 +12,7 @@ pub mod tree;
 use crate::cards::{cards_to_string, combo_from_index, parse_cards, rank, suit, Card, NUM_COMBOS};
 use crate::preflop::equity::{class_index, NUM_CLASSES};
 use serde::{Deserialize, Serialize};
-use showdown::{flop_runouts, sampled_cards, Board};
+use showdown::{sample_cards, sample_runouts, Board};
 use solve::Solver;
 use tree::{Builder, TreeConfig};
 
@@ -57,6 +57,14 @@ pub struct SolveRequest {
     /// Sampled turn cards to deal (0: the tree ends on the flop).
     #[serde(default)]
     pub turn_cards: usize,
+    /// Turn bet sizes, raise sizes and raise cap; the flop's when absent
+    /// (an empty list: check or call only).
+    #[serde(default)]
+    pub turn_bet_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub turn_raise_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub turn_max_raises: Option<u8>,
     /// Board completions each showdown averages over.
     #[serde(default = "default_runouts")]
     pub runouts: usize,
@@ -196,10 +204,14 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
         max_raises: req.max_raises,
         allin_threshold: req.allin_threshold,
         turn_cards: req.turn_cards,
+        turn_bet_sizes: req.turn_bet_sizes.clone(),
+        turn_raise_sizes: req.turn_raise_sizes.clone(),
+        turn_max_raises: req.turn_max_raises,
     };
-    let turn_cards = if req.turn_cards > 0 { sampled_cards(&flop, req.turn_cards) } else { Vec::new() };
+    let (turn_cards, turn_weights) = if req.turn_cards > 0 { sample_cards(&flop, req.turn_cards) } else { (Vec::new(), Vec::new()) };
     let max_nodes = (req.max_arena_mb * 1e6 / (8.0 * NUM_COMBOS as f64)) as usize;
-    let tree = Builder::build(&cfg, turn_cards.clone(), NUM_COMBOS, max_nodes.max(1000))?;
+    let mut tree = Builder::build(&cfg, turn_cards.clone(), NUM_COMBOS, max_nodes.max(1000))?;
+    tree.turn_weights = turn_weights;
     let arena_mb = tree.data_size.iter().sum::<usize>() as f64 * 8.0 / 1e6;
     if arena_mb > req.max_arena_mb {
         return Err(format!(
@@ -207,14 +219,20 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
             req.max_arena_mb
         ));
     }
+    // Set 0 runs the flop out for all-in leaves: about `runouts` class-weighted
+    // turn × river boards; set 1 + i runs turn card i out over `runouts` rivers.
     let mut boards: Vec<Vec<Board>> = Vec::with_capacity(1 + turn_cards.len());
-    boards.push(flop_runouts(&flop, req.runouts).into_iter().map(Board::new).collect());
+    let turns = (req.runouts as f64).sqrt().ceil().max(1.0) as usize;
+    let rivers = req.runouts.div_ceil(turns).max(1);
+    boards.push(sample_runouts(&flop, turns, rivers).into_iter().map(|(cards, w)| Board::weighted(cards, w)).collect());
     for &t in &turn_cards {
         let four = [flop[0], flop[1], flop[2], t];
+        let (cards, weights) = sample_cards(&four, req.runouts);
         boards.push(
-            sampled_cards(&four, req.runouts)
+            cards
                 .into_iter()
-                .map(|r| Board::new([flop[0], flop[1], flop[2], t, r]))
+                .zip(weights)
+                .map(|(r, w)| Board::weighted([flop[0], flop[1], flop[2], t, r], w))
                 .collect(),
         );
     }
@@ -318,6 +336,9 @@ mod tests {
             max_raises: 1,
             allin_threshold: 0.65,
             turn_cards: 0,
+            turn_bet_sizes: None,
+            turn_raise_sizes: None,
+            turn_max_raises: None,
             runouts: 12,
             iterations: 40,
             check_every: 20,
@@ -383,10 +404,9 @@ mod tests {
         assert!((total - 7.5).abs() < 0.3, "range EVs sum to {total}");
     }
 
-    /// Three seats checking down every runout own a third of the pot each,
-    /// up to the deck approximation (opponents independent of each other):
-    /// the overlapping opponent hands it counts are correlated, which lifts
-    /// every seat's share by about one percent of the pot.
+    /// Three seats checking down every runout own a third of the pot each:
+    /// with two other seats the deck is exact (showdown.rs `Pair`), so the
+    /// shares sum to the whole pot.
     #[test]
     fn checking_down_every_runout_splits_the_pot_three_ways() {
         let mut req = request(vec![seat("SB", uniform(1.0)), seat("BB", uniform(1.0)), seat("BTN", uniform(1.0))], 7.5);
@@ -397,8 +417,34 @@ mod tests {
         req.bet_sizes = vec![];
         let res = solve(&req).unwrap();
         for s in &res.seats {
-            assert!((s.range_ev - 2.5).abs() < 0.04, "{}: {}", s.position, s.range_ev);
+            assert!((s.range_ev - 2.5).abs() < 0.01, "{}: {}", s.position, s.range_ev);
         }
+    }
+
+    /// Heads-up there is no deck approximation, so a check-down over every
+    /// runout must own exactly the pot — dead money included. Without the
+    /// sample weighting (showdown.rs `sample_weight`) the opponent's hands
+    /// are counted only under the runouts they leave possible, which shrinks
+    /// every net result by a twelfth and loses a twelfth of the dead money.
+    #[test]
+    fn heads_up_check_down_owns_the_dead_money_too() {
+        let mut req = request(vec![seat("BB", uniform(1.0)), seat("BTN", uniform(1.0))], 6.0);
+        req.turn_cards = 49;
+        req.runouts = 48;
+        req.iterations = 1;
+        req.check_every = 1;
+        req.bet_sizes = vec![];
+        let res = solve(&req).unwrap();
+        let total: f64 = res.seats.iter().map(|s| s.range_ev).sum();
+        assert!((total - 6.0).abs() < 0.02, "range EVs {:?}", res.seats.iter().map(|s| s.range_ev).collect::<Vec<_>>());
+        for s in &res.seats {
+            assert!((s.range_ev - 3.0).abs() < 0.02, "{}: {}", s.position, s.range_ev);
+        }
+        // Top set owns most of the pot; queen-high far less than its stake.
+        let kk = res.seats[1].values[class_index(11, 11, false)];
+        let queen_three = res.seats[1].values[class_index(10, 1, false)];
+        assert!(kk > 5.4, "KK owns {kk}");
+        assert!(queen_three < 2.4, "Q3o owns {queen_three}");
     }
 
     /// A hand's value is conditional on holding it: the weight the hero's

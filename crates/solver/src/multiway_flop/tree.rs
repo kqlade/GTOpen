@@ -83,6 +83,28 @@ pub struct TreeConfig {
     /// How many turn cards to deal (0: the tree stops at the flop).
     #[serde(default)]
     pub turn_cards: usize,
+    /// Turn bet sizes, raise sizes and raise cap; the flop's when absent.
+    /// An empty list means check or call only.
+    #[serde(default)]
+    pub turn_bet_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub turn_raise_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub turn_max_raises: Option<u8>,
+}
+
+impl TreeConfig {
+    /// (bet sizes, raise sizes, raise cap) for a street (0 flop, 1 turn).
+    pub fn street_sizes(&self, street: u8) -> (&[f64], &[f64], u8) {
+        if street == 0 {
+            return (&self.bet_sizes, &self.raise_sizes, self.max_raises);
+        }
+        (
+            self.turn_bet_sizes.as_deref().unwrap_or(&self.bet_sizes),
+            self.turn_raise_sizes.as_deref().unwrap_or(&self.raise_sizes),
+            self.turn_max_raises.unwrap_or(self.max_raises),
+        )
+    }
 }
 
 fn default_max_raises() -> u8 {
@@ -100,8 +122,10 @@ pub struct Tree {
     pub nodes: Vec<Node>,
     /// f32 elements each seat's regret and strategy arenas need.
     pub data_size: Vec<usize>,
-    /// Sampled turn cards (empty for a one-street tree).
+    /// Sampled turn cards (empty for a one-street tree) and the share of
+    /// the deck each stands for (sum one).
     pub turn_cards: Vec<u8>,
+    pub turn_weights: Vec<f32>,
 }
 
 impl Tree {
@@ -190,7 +214,13 @@ impl<'a> Builder<'a> {
             ));
         }
         let dead = dead.max(0.0);
-        if cfg.bet_sizes.iter().chain(&cfg.raise_sizes).any(|s| !(*s > 0.0 && s.is_finite())) {
+        let sizes = cfg
+            .bet_sizes
+            .iter()
+            .chain(&cfg.raise_sizes)
+            .chain(cfg.turn_bet_sizes.iter().flatten())
+            .chain(cfg.turn_raise_sizes.iter().flatten());
+        if sizes.into_iter().any(|s| !(*s > 0.0 && s.is_finite())) {
             return Err("bet and raise sizes must be positive finite numbers".into());
         }
         if !(cfg.allin_threshold > 0.0 && cfg.allin_threshold <= 1.0) {
@@ -225,6 +255,7 @@ impl<'a> Builder<'a> {
             raises: 0,
         };
         b.action(st)?;
+        let n = b.turn_cards.len();
         let mut tree = Tree {
             cfg: cfg.clone(),
             seats,
@@ -232,6 +263,7 @@ impl<'a> Builder<'a> {
             nodes: b.nodes,
             data_size: b.data_size,
             turn_cards: b.turn_cards,
+            turn_weights: vec![1.0 / n.max(1) as f32; n],
         };
         assign_runout_sets(&mut tree);
         Ok(tree)
@@ -260,15 +292,16 @@ impl<'a> Builder<'a> {
         let me = st.to_act;
         let behind = self.behind(st, me);
         let facing = st.current_bet - st.street_bet[me];
+        let (bet_sizes, raise_sizes, max_raises) = self.cfg.street_sizes(st.street);
         let mut out = Vec::new();
         if facing > 1e-9 {
             out.push(Action::Fold);
             out.push(Action::Call(st.current_bet.min(st.street_bet[me] + behind)));
-            if behind > facing + 1e-9 && st.raises < self.cfg.max_raises {
+            if behind > facing + 1e-9 && st.raises < max_raises {
                 let max_to = st.street_bet[me] + behind;
                 let min_to = st.current_bet + st.last_increment.max(1e-9);
                 let mut tos: Vec<f64> = Vec::new();
-                for m in &self.cfg.raise_sizes {
+                for m in raise_sizes {
                     let mut to = st.current_bet * m;
                     if to < min_to {
                         to = min_to;
@@ -288,7 +321,7 @@ impl<'a> Builder<'a> {
                 let pot = self.pot(st);
                 let max_to = st.street_bet[me] + behind;
                 let mut tos: Vec<f64> = Vec::new();
-                for f in &self.cfg.bet_sizes {
+                for f in bet_sizes {
                     let mut to = st.street_bet[me] + f * pot;
                     let committed = st.put[me] - st.street_bet[me] + to - self.cfg.invested[me];
                     if to >= max_to - 1e-9 || committed >= self.cfg.allin_threshold * self.cfg.stack - 1e-9 {
@@ -474,6 +507,9 @@ mod tests {
             max_raises: 2,
             allin_threshold: 0.65,
             turn_cards: 0,
+            turn_bet_sizes: None,
+            turn_raise_sizes: None,
+            turn_max_raises: None,
         }
     }
 
@@ -581,6 +617,34 @@ mod tests {
         let bb = &tree.nodes[root.children[2] as usize]; // the all-in bet
         let btn = &tree.nodes[bb.children[1] as usize];
         assert_eq!(tree.nodes[btn.children[1] as usize].kind, KIND_SHOWDOWN);
+    }
+
+    #[test]
+    fn the_turn_has_its_own_sizes() {
+        let mut c = cfg(3);
+        c.turn_cards = 2;
+        let full = Builder::build(&c, vec![4, 9], 1326, 1_000_000).unwrap();
+        c.turn_bet_sizes = Some(vec![0.66]);
+        c.turn_raise_sizes = Some(vec![]);
+        c.turn_max_raises = Some(0);
+        let tree = Builder::build(&c, vec![4, 9], 1326, 1_000_000).unwrap();
+        assert!(tree.nodes.len() < full.nodes.len() / 2, "{} vs {}", tree.nodes.len(), full.nodes.len());
+        // Flop sizes unchanged; on the turn: check or one bet, and no raises.
+        let root = &tree.nodes[0];
+        assert_eq!(root.actions.len(), 3);
+        let n1 = &tree.nodes[root.children[0] as usize];
+        let n2 = &tree.nodes[n1.children[0] as usize];
+        let chance = &tree.nodes[n2.children[0] as usize];
+        let turn = &tree.nodes[chance.children[0] as usize];
+        assert_eq!(turn.actions.len(), 2);
+        assert!(matches!(turn.actions[1], Action::Bet(to) if (to - 0.66 * 7.5).abs() < 1e-9));
+        let facing = &tree.nodes[turn.children[1] as usize];
+        assert_eq!(facing.actions.len(), 2, "{:?}", facing.actions);
+        // Check-only turn: every turn line checks to a showdown.
+        c.turn_bet_sizes = Some(vec![]);
+        let tree = Builder::build(&c, vec![4, 9], 1326, 1_000_000).unwrap();
+        let turn_bets = tree.nodes.iter().filter(|n| n.street == 1 && n.kind == KIND_ACTION && n.actions.len() > 1).count();
+        assert_eq!(turn_bets, 0);
     }
 
     #[test]

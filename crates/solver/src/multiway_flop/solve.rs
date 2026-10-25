@@ -1,7 +1,7 @@
 //! Vector-form discounted CFR over the multiway tree, with the best-response
 //! gap and the root values the preflop engine consumes.
 
-use super::showdown::{compatible_mass, showdown, Board};
+use super::showdown::{compatible_mass, compatible_pair_mass, sample_weight, showdown, Board};
 use super::tree::{Action, Tree, KIND_ACTION, KIND_CHANCE, KIND_FOLD_OUT, KIND_SHOWDOWN};
 use crate::cards::{combo_from_index, NUM_COMBOS};
 
@@ -110,18 +110,28 @@ impl Solver {
 
     /// The other seats' compatible reach mass at the root, per hero combo.
     pub fn root_mass(&self, hero: usize) -> Vec<f32> {
-        let mut mass = vec![1f32; NUM_COMBOS];
+        let mut mass = vec![0f64; NUM_COMBOS];
+        self.others_mass(hero, &self.root_reach, &mut mass);
+        mass.iter().map(|m| *m as f32).collect()
+    }
+
+    /// `out[h]` = mass of the other seats' hands compatible with hero combo
+    /// `h` and (with two other seats) with each other; more seats are taken
+    /// as independent of each other.
+    fn others_mass(&self, hero: usize, reach: &[Vec<f32>], out: &mut [f64]) {
+        let others: Vec<usize> = (0..self.tree.seats).filter(|&q| q != hero).collect();
+        if let [q1, q2] = others[..] {
+            compatible_pair_mass(&reach[q1], &reach[q2], &self.by_card, out);
+            return;
+        }
+        out.iter_mut().for_each(|v| *v = 1.0);
         let mut one = vec![0f32; NUM_COMBOS];
-        for q in 0..self.tree.seats {
-            if q == hero {
-                continue;
-            }
-            compatible_mass(&self.root_reach[q], &self.by_card, &mut one);
+        for q in others {
+            compatible_mass(&reach[q], &self.by_card, &mut one);
             for h in 0..NUM_COMBOS {
-                mass[h] *= one[h];
+                out[h] *= one[h] as f64;
             }
         }
-        mass
     }
 
     /// Average strategy at an action node: `[action][combo]`.
@@ -178,19 +188,24 @@ impl Solver {
                 let pot = self.tree.pot_at(nd);
                 let pot_eff = pot - self.tree.rake(pot);
                 let set = nd.runout_set as usize;
+                // set 0 runs the flop out (two cards); the others run a turn card out (one)
+                let drawn = if set == 0 { 2 } else { 1 };
                 let live_opps: Vec<usize> = (0..seats).filter(|&q| q != hero && live & (1 << q) != 0).collect();
                 let folded: Vec<usize> = (0..seats).filter(|&q| q != hero && live & (1 << q) == 0).collect();
                 let boards = std::mem::take(&mut self.boards[set]);
                 let mut scratch = std::mem::take(&mut self.scratch);
-                showdown(&boards, hero, &live_opps, &folded, reach, pot_eff, put_hero, out, &mut scratch);
+                showdown(&boards, drawn, hero, &live_opps, &folded, reach, pot_eff, put_hero, out, &mut scratch);
                 self.boards[set] = boards;
                 self.scratch = scratch;
             }
             KIND_CHANCE => {
-                let mut count = vec![0u16; NUM_COMBOS];
+                // the turn card comes from the deck every seat's hand leaves (showdown.rs `sample_weight`)
+                let weight = sample_weight(47, seats - 1, 1) as f32;
+                let mut norm = vec![0f32; NUM_COMBOS];
                 let mut child_out = vec![0f32; NUM_COMBOS];
                 for (i, &child) in children.iter().enumerate() {
                     let card = self.tree.turn_cards[i];
+                    let w = self.tree.turn_weights[i];
                     let mut masked = reach.clone();
                     for r in masked.iter_mut() {
                         for &idx in &self.by_card[card as usize] {
@@ -202,14 +217,14 @@ impl Solver {
                     for h in 0..NUM_COMBOS {
                         let (a, b) = combo_from_index(h);
                         if a != card && b != card {
-                            out[h] += child_out[h];
-                            count[h] += 1;
+                            out[h] += w * child_out[h];
+                            norm[h] += w;
                         }
                     }
                 }
                 for h in 0..NUM_COMBOS {
-                    if count[h] > 0 {
-                        out[h] /= count[h] as f32;
+                    if norm[h] > 0.0 {
+                        out[h] *= weight / norm[h];
                     }
                 }
             }
@@ -275,19 +290,10 @@ impl Solver {
         }
     }
 
-    /// `out[h] = delta × Π_{q ≠ hero} compatible mass of q`.
+    /// `out[h] = delta × mass of the other seats' hands compatible with h`.
     fn fold_payoff(&self, hero: usize, reach: &[Vec<f32>], delta: f64, out: &mut [f32]) {
-        let mut mass = vec![1f64; NUM_COMBOS];
-        let mut one = vec![0f32; NUM_COMBOS];
-        for q in 0..self.tree.seats {
-            if q == hero {
-                continue;
-            }
-            compatible_mass(&reach[q], &self.by_card, &mut one);
-            for h in 0..NUM_COMBOS {
-                mass[h] *= one[h] as f64;
-            }
-        }
+        let mut mass = vec![0f64; NUM_COMBOS];
+        self.others_mass(hero, reach, &mut mass);
         for h in 0..NUM_COMBOS {
             out[h] = (mass[h] * delta) as f32;
         }
