@@ -16,8 +16,9 @@ const MAGIC_LEGACY: &[u8] = b"GTOPREFLOP1\n";
 const MAGIC_COUPLED_DECK: &[u8] = b"GTOPREFLOP2\n";
 const MAGIC_BALANCED: &[u8] = b"GTOPREFLOP4\n";
 const MAGIC_STRADDLE: &[u8] = b"GTOPREFLOP3\n";
-// Arenas learned against measured flop values (leaf.rs): an older binary
-// must refuse them rather than continue the solve against the model payoffs.
+// Arenas learned against measured flop values (leaf.rs) or with card
+// removal (removal.rs): an older binary must refuse them rather than
+// continue the solve against the model payoffs.
 const MAGIC_LEAVES: &[u8] = b"GTOPREFLOP5\n";
 
 fn legacy_multiway_equity_model() -> String {
@@ -156,7 +157,7 @@ impl PreflopSolver {
     fn write_game(&self, path: &str) -> Result<(), String> {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut w = BufWriter::new(file);
-        let magic = if self.leaf.is_some() {
+        let magic = if self.leaf.is_some() || self.cfg.card_removal {
             MAGIC_LEAVES
         } else if self.cfg.realization == "balanced" || self.cfg.fourbet_mults.is_some() || self.cfg.fourbet_mults_by_seat.is_some() {
             MAGIC_BALANCED
@@ -224,8 +225,10 @@ impl PreflopSolver {
         if (magic == MAGIC_BALANCED || magic == MAGIC_LEAVES) && raw_header.get("config").and_then(|c| c.get("realization")).is_none() {
             return Err("preflop v4 save is missing its heads-up realization model".into());
         }
-        if (magic == MAGIC_LEAVES) != raw_header.get("leaf_values").is_some_and(|v| !v.is_null()) {
-            return Err("preflop v5 saves carry measured flop values, and only they do".into());
+        let v5_payoffs = raw_header.get("leaf_values").is_some_and(|v| !v.is_null())
+            || raw_header.get("config").and_then(|c| c.get("card_removal")).and_then(|v| v.as_bool()) == Some(true);
+        if (magic == MAGIC_LEAVES) != v5_payoffs {
+            return Err("preflop v5 saves carry measured flop values or card removal, and only they do".into());
         }
         let header: Header = serde_json::from_value(raw_header).map_err(|e| e.to_string())?;
         if magic != MAGIC_BALANCED && magic != MAGIC_LEAVES && (magic==MAGIC_STRADDLE)!=header.config.utg_straddle {
@@ -276,7 +279,7 @@ mod tests {
             max_raises: 1, add_allin: true, allin_threshold: 0.85,
             rake_pct: 0.0, rake_cap: 0.0, no_flop_no_drop: true,
             realization: "raw".into(), call_only_seats: vec![],
-            open_raises_by_seat: None, fourbet_mults: None, fourbet_mults_by_seat: None, raise_mults_by_seat: None,
+            open_raises_by_seat: None, fourbet_mults: None, fourbet_mults_by_seat: None, card_removal: false, raise_mults_by_seat: None,
         };
         PreflopSolver::new(cfg, EQ.get_or_init(|| Arc::new(EquityTable::build(8))).clone()).unwrap()
     }
@@ -388,6 +391,27 @@ mod tests {
         std::fs::write(path_s, &forged).unwrap();
         let err = PreflopSolver::load_game(path_s, original.eq.clone()).err().expect("v4 magic over a v5 header is refused");
         assert!(err.contains("v5"), "{err}");
+        std::fs::remove_file(path_s).unwrap();
+    }
+
+    #[test]
+    fn card_removal_saves_as_v5() {
+        let mut cfg = fixture().cfg.clone();
+        cfg.card_removal = true;
+        let mut original = PreflopSolver::new(cfg, fixture().eq.clone()).unwrap();
+        original.iteration = 3;
+        let path_s = std::env::temp_dir().join(format!("gtopen-removal-save-{}.gtop", std::process::id()));
+        let path_s = path_s.to_str().unwrap();
+        original.save_game(path_s).unwrap();
+        let saved = std::fs::read(path_s).unwrap();
+        assert_eq!(&saved[..MAGIC_LEAVES.len()], MAGIC_LEAVES);
+        let loaded = PreflopSolver::load_game(path_s, original.eq.clone()).unwrap();
+        assert!(loaded.cfg.card_removal && loaded.removal.is_some());
+        assert_eq!(loaded.iteration, 3);
+        let mut forged = saved.clone();
+        forged[..MAGIC_BALANCED.len()].copy_from_slice(MAGIC_BALANCED);
+        std::fs::write(path_s, &forged).unwrap();
+        assert!(PreflopSolver::load_game(path_s, original.eq.clone()).is_err());
         std::fs::remove_file(path_s).unwrap();
     }
 }

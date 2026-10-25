@@ -257,7 +257,7 @@ mod tests {
             max_raises: 2, add_allin: false, allin_threshold: 0.85,
             rake_pct: 5.0, rake_cap: 1.0, no_flop_no_drop: true,
             realization: "balanced".into(), call_only_seats: vec![],
-            open_raises_by_seat: None, fourbet_mults: None, fourbet_mults_by_seat: None, raise_mults_by_seat: None,
+            open_raises_by_seat: None, fourbet_mults: None, fourbet_mults_by_seat: None, card_removal: false, raise_mults_by_seat: None,
         };
         PreflopSolver::new(cfg, EQ.get_or_init(|| Arc::new(EquityTable::build(8))).clone()).unwrap()
     }
@@ -363,6 +363,56 @@ mod tests {
         f.terminals.push(f.terminals[0].clone());
         assert!(s.set_leaf_values(Some(f)).unwrap_err().contains("appears twice"));
         assert!(s.leaf_values().is_none(), "a rejected table must not be installed");
+    }
+
+    #[test]
+    fn card_removal_shapes_the_opponents_reach_per_hero_class() {
+        use super::super::equity::{class_index, class_prob};
+        use super::super::KIND_FOLD_WIN;
+        let plain = fixture();
+        let mut cfg = plain.cfg.clone();
+        cfg.card_removal = true;
+        let s = PreflopSolver::new(cfg, plain.eq.clone()).unwrap();
+        let (btn, bb) = (0usize, 2usize);
+        let (aa, a5s, x72) = (class_index(12, 12, false), class_index(12, 3, true), class_index(5, 0, false));
+        let root: Vec<Vec<f32>> = (0..3).map(|_| (0..NUM_CLASSES).map(class_prob).collect()).collect();
+        // Untouched ranges reach with probability 1 for every hero class, so
+        // over the hero's own range a terminal pays the same with removal.
+        let flop = s.node_at(&hu_flop_path(&s)).unwrap();
+        let (mut with, mut without) = (vec![0f32; NUM_CLASSES], vec![0f32; NUM_CLASSES]);
+        s.terminal_value(flop, bb, &root, &mut with);
+        plain.terminal_value(flop, bb, &root, &mut without);
+        let total = |v: &[f32]| v.iter().zip(0..NUM_CLASSES).map(|(x, h)| *x as f64 * class_prob(h) as f64).sum::<f64>();
+        assert!((total(&with) - total(&without)).abs() < 1e-3, "{} vs {}", total(&with), total(&without));
+        // BTN raises, SB folds, BB folds: BTN wins the blinds. With BB's folding
+        // range being AA only, BTN's win is weighted by how likely that AA is
+        // given BTN's own hand: a sixth as likely with AA, half with an ace.
+        let raise = s.nodes[0].actions.iter().position(|a| a.kind == "raise").unwrap();
+        let sb_node = s.node_at(&[raise]).unwrap();
+        let sb_fold = s.nodes[sb_node].actions.iter().position(|a| a.kind == "fold").unwrap();
+        let bb_node = s.node_at(&[raise, sb_fold]).unwrap();
+        let bb_fold = s.nodes[bb_node].actions.iter().position(|a| a.kind == "fold").unwrap();
+        let fold_win = s.node_at(&[raise, sb_fold, bb_fold]).unwrap();
+        assert_eq!(s.nodes[fold_win].kind, KIND_FOLD_WIN);
+        let mut reaches = root.clone();
+        reaches[bb] = vec![0.0; NUM_CLASSES];
+        reaches[bb][aa] = class_prob(aa);
+        let mut out = vec![0f32; NUM_CLASSES];
+        s.terminal_value(fold_win, btn, &reaches, &mut out);
+        assert!((out[aa] / out[x72] - 1.0 / 6.0).abs() < 1e-4, "{} vs {}", out[aa], out[x72]);
+        assert!((out[a5s] / out[x72] - 0.5).abs() < 1e-4, "{} vs {}", out[a5s], out[x72]);
+        plain.terminal_value(fold_win, btn, &reaches, &mut out);
+        assert!((out[aa] - out[x72]).abs() < 1e-6, "without removal every class sees the same fold");
+        // The same at the flop: against a BTN holding AA only, BB's AA is worth a
+        // sixth of 72o's reach weight (its equity differs too, so compare the
+        // reach factor through the opponents' dead-money term).
+        let mut reaches = root.clone();
+        reaches[btn] = vec![0.0; NUM_CLASSES];
+        reaches[btn][aa] = class_prob(aa);
+        s.terminal_value(flop, 1, &reaches, &mut out); // the folded SB: pays -invested x others' reach
+        let sb_inv = s.nodes[flop].invested[1];
+        assert!(sb_inv > 0.0);
+        assert!((out[aa] / out[x72] - 1.0 / 6.0).abs() < 1e-4, "{} vs {}", out[aa], out[x72]);
     }
 
     #[test]

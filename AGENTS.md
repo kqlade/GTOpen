@@ -94,7 +94,9 @@ the HU game was priced with the static model; `multiway_equity_model` identifies
 the active continuation version; `leaf_values` names the measured flop-value
 table pricing the HU flop terminals, or null — see `docs/measured_flop_values.md`
 and `leaf-values` `{...table...}` | `null`, which installs or clears one and
-restarts learning), `session` (GET: the live game —
+restarts learning; config `card_removal: true` weights every other seat's
+reach by the hero's cards, `crates/solver/src/preflop/removal.rs` — both are
+CPU-only and save as v5), `session` (GET: the live game —
 config, seats, iteration, hero/frozen, state), `stop`,
 `node` `{"path":[i,j,...]}` (action indices; returns actor, actions+freqs,
 `strategy` as na×169 action-major flat array, per-class reach), `generate`

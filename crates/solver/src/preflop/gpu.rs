@@ -874,6 +874,9 @@ impl PreflopGpu {
         if s.leaf_values().is_some() {
             return Err("measured flop values are priced on the CPU only".into());
         }
+        if s.cfg.card_removal {
+            return Err("card removal is priced on the CPU only".into());
+        }
         let reach_blocks = s.nodes.len().checked_add(s.n - 1)
             .filter(|&len| len <= u32::MAX as usize)
             .ok_or_else(|| "reach table beyond 32-bit block indexing; solving on CPU".to_string())?;

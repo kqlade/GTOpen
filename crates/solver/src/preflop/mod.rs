@@ -22,6 +22,8 @@ mod continuation;
 pub use continuation::{ContinuationEstimate, ContinuationPlayerValue};
 mod leaf;
 pub use leaf::{LeafFallbackCell, LeafTerminalFile, LeafValues, LeafValuesFile, LeafValuesSummary};
+mod removal;
+pub use removal::Removal;
 mod save;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -120,6 +122,11 @@ pub struct PreflopConfig {
     pub fourbet_mults: Option<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fourbet_mults_by_seat: Option<Vec<Vec<f64>>>,
+    /// Weight every other seat's reach by the cards the hero's class removes
+    /// from the deck (removal.rs), instead of dealing classes independently.
+    /// Priced on the CPU only; saves as v5.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub card_removal: bool,
 }
 
 fn is_false(value: &bool) -> bool { !*value }
@@ -644,6 +651,9 @@ pub struct PreflopSolver {
     /// Flop values measured by the postflop solver; where set they price the
     /// heads-up flop terminals ahead of `fit` (see leaf.rs).
     leaf: Option<LeafValues>,
+    /// Set when `cfg.card_removal`: the hero's cards shape every other seat's
+    /// reach at the terminals (removal.rs).
+    removal: Option<Removal>,
     /// Frozen seats play their current average strategy and stop adapting.
     pub seat_frozen: Vec<bool>,
     /// Ruled seats play their profile in covered buckets.
@@ -721,9 +731,11 @@ impl PreflopSolver {
                  multipliers, the raise cap, or limps."
             ));
         }
+        let removal = cfg.card_removal.then(|| Removal::new(&eq));
         let mut s = PreflopSolver {
             cfg,
             eq,
+            removal,
             nodes: Vec::new(),
             children: Vec::new(),
             n,
@@ -1678,6 +1690,9 @@ impl PreflopSolver {
         #[cfg(test)]
         checkpoint_tests::observe_terminal();
         let nd = &self.nodes[node];
+        // Everyone else's chance of holding a hand and taking their actions.
+        // Without card removal it is one number; with it, the hero's cards
+        // make each other seat's reaching mass depend on the hero's class.
         let mut prob = 1f64;
         for q in 0..self.n {
             if q != p {
@@ -1689,6 +1704,41 @@ impl PreflopSolver {
             out.iter_mut().for_each(|v| *v = 0.0);
             return;
         }
+        let live_opponent = |q: usize| q != p && nd.live & (1 << q) != 0;
+        let mut others = [prob; NUM_CLASSES];
+        // Per live opponent q: its reaching mass seen from each hero class and
+        // the equity-weighted mass, so hero's equity vs q is eq_mass / mass.
+        let mut opponents: Vec<(usize, [f32; NUM_CLASSES], [f32; NUM_CLASSES])> = Vec::new();
+        match &self.removal {
+            Some(removal) => {
+                others.fill(1.0);
+                for q in 0..self.n {
+                    if q == p {
+                        continue;
+                    }
+                    let (mut mass, mut eq_mass) = ([0f32; NUM_CLASSES], [0f32; NUM_CLASSES]);
+                    removal.masses(&reaches[q], &mut mass, &mut eq_mass);
+                    for h in 0..NUM_CLASSES {
+                        others[h] *= mass[h] as f64;
+                    }
+                    if nd.kind == KIND_POT_SHARE && live_opponent(q) {
+                        opponents.push((q, mass, eq_mass));
+                    }
+                }
+            }
+            None => {
+                if nd.kind == KIND_POT_SHARE {
+                    for q in 0..self.n {
+                        if live_opponent(q) {
+                            let s: f32 = reaches[q].iter().sum();
+                            let mut eq_mass = [0f32; NUM_CLASSES];
+                            self.eq.eqs_vs_dist(&reaches[q], &mut eq_mass);
+                            opponents.push((q, [s; NUM_CLASSES], eq_mass));
+                        }
+                    }
+                }
+            }
+        }
         let inv_p = nd.invested[p];
         match nd.kind {
             KIND_FOLD_WIN => {
@@ -1698,47 +1748,53 @@ impl PreflopSolver {
                 } else {
                     -inv_p
                 };
-                out.iter_mut().for_each(|v| *v = (prob * delta) as f32);
+                for h in 0..NUM_CLASSES {
+                    out[h] = (others[h] * delta) as f32;
+                }
             }
             KIND_POT_SHARE => {
                 let rake = self.rake_of(nd.pot);
                 let pot_eff = nd.pot - rake;
                 if nd.live & (1 << p) == 0 {
-                    out.iter_mut().for_each(|v| *v = (prob * -inv_p) as f32);
-                    return;
-                }
-                // normalized opponent class distributions
-                let mut dists: Vec<Vec<f32>> = Vec::new();
-                for q in 0..self.n {
-                    if q != p && nd.live & (1 << q) != 0 {
-                        let s: f32 = reaches[q].iter().sum();
-                        if s > 0.0 {
-                            dists.push(reaches[q].iter().map(|&x| x / s).collect());
-                        }
+                    for h in 0..NUM_CLASSES {
+                        out[h] = (others[h] * -inv_p) as f32;
                     }
+                    return;
                 }
                 if let (Some(model), true) = (&self.multiway, nd.live.count_ones() >= 3 && prob >= 1e-3) {
+                    // The coupled-deck model takes range distributions, not
+                    // per-class ones; removal shapes the reach, not the shares.
+                    let dists: Vec<Vec<f32>> = opponents.iter().filter_map(|(q, _, _)| {
+                        let s: f32 = reaches[*q].iter().sum();
+                        (s > 0.0).then(|| reaches[*q].iter().map(|&x| x / s).collect())
+                    }).collect();
                     let equities = model.equities(&dists);
                     for h in 0..NUM_CLASSES {
-                        out[h] = (prob * (pot_eff * equities[h] - inv_p)) as f32;
+                        out[h] = (others[h] * (pot_eff * equities[h] - inv_p)) as f32;
                     }
                     return;
                 }
+                // hero's equity against each live opponent's reaching range
+                let equities: Vec<[f32; NUM_CLASSES]> = opponents.iter().map(|(_, mass, eq_mass)| {
+                    let mut values = [0.0f32; NUM_CLASSES];
+                    for h in 0..NUM_CLASSES {
+                        values[h] = if mass[h] > 0.0 { eq_mass[h] / mass[h] } else { 0.0 };
+                    }
+                    values
+                }).collect();
                 if nd.live.count_ones() == 2 {
                     // Measured by the postflop solver: chips collected from the
                     // flop on, future bets and rake inside (leaf.rs).
                     if let Some(values) = self.leaf.as_ref().and_then(|l| l.values(node)) {
                         let v = &values[p];
                         for h in 0..NUM_CLASSES {
-                            out[h] = (prob * (v[h] as f64 - inv_p)) as f32;
+                            out[h] = (others[h] * (v[h] as f64 - inv_p)) as f32;
                         }
                         return;
                     }
                     if let Some(ratio) = self.leaf_fallback(node, p) {
-                        let mut values = [0.0f32; NUM_CLASSES];
-                        self.eq.eqs_vs_dist(&dists[0], &mut values);
                         for h in 0..NUM_CLASSES {
-                            out[h] = (prob * (pot_eff * values[h] as f64 * ratio as f64 - inv_p)) as f32;
+                            out[h] = (others[h] * (pot_eff * equities[0][h] as f64 * ratio as f64 - inv_p)) as f32;
                         }
                         return;
                     }
@@ -1746,26 +1802,27 @@ impl PreflopSolver {
                 if self.cfg.realization == "balanced" && nd.live.count_ones() == 2 {
                     let w = nd.r[p];
                     let blend = ((w - 1.0).abs() / 0.08).min(1.0);
-                    let dist = &dists[0];
+                    let (q, mass, _) = &opponents[0];
+                    let reach = &reaches[*q];
                     for h in 0..NUM_CLASSES {
+                        if mass[h] <= 0.0 {
+                            out[h] = (others[h] * -inv_p) as f32;
+                            continue;
+                        }
                         let mut raw_share = 0.0f32;
                         let mut relative_share = 0.0f32;
                         for j in 0..NUM_CLASSES {
+                            let weight = reach[j] * self.removal.as_ref().map_or(1.0, |r| r.factor(h, j)) / mass[h];
                             let eq = self.balanced_raw_equity(h,j);
                             let relative = self.fit.as_ref().map_or(eq, |f| f.balanced_share(eq,h,j,w<1.0));
-                            raw_share += dist[j] * eq;
-                            relative_share += dist[j] * relative;
+                            raw_share += weight * eq;
+                            relative_share += weight * relative;
                         }
                         let share = raw_share + blend * (relative_share-raw_share);
-                        out[h] = (prob * (pot_eff * share as f64 - inv_p)) as f32;
+                        out[h] = (others[h] * (pot_eff * share as f64 - inv_p)) as f32;
                     }
                     return;
                 }
-                let equities: Vec<[f32; NUM_CLASSES]> = dists.iter().map(|dist| {
-                    let mut values = [0.0; NUM_CLASSES];
-                    self.eq.eqs_vs_dist(dist, &mut values);
-                    values
-                }).collect();
                 // spr at this terminal (0 = everyone effectively all-in:
                 // no postflop play; no realization adjustment)
                 let mut min_left = f64::MAX;
@@ -1797,7 +1854,7 @@ impl PreflopSolver {
                         }
                         let r = fit.class_r(h, posw);
                         let share = nd.pot * eqp * r;
-                        out[h] = (prob * (share - inv_p)) as f32;
+                        out[h] = (others[h] * (share - inv_p)) as f32;
                     }
                     return;
                 }
@@ -1808,7 +1865,7 @@ impl PreflopSolver {
                         eqp *= values[h] as f64;
                     }
                     let share = (pot_eff * eqp * rp).min(pot_eff);
-                    out[h] = (prob * (share - inv_p)) as f32;
+                    out[h] = (others[h] * (share - inv_p)) as f32;
                 }
             }
             _ => unreachable!(),

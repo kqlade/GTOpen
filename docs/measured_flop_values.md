@@ -90,6 +90,18 @@ move with the strategy the values produce. So the table is a fixed point:
 The app's driver is `scripts/gpu-calibrate.py` in lucky-chances (Modal, one
 postflop solve at a time per container, many containers).
 
+## Card removal
+
+The same solve can switch the tree's chance model from independent classes
+to first-order card removal (`card_removal: true` in the config,
+`removal.rs`): every other seat's reaching mass is weighted, per hero class,
+by how many of its combos the hero's cards leave in the deck, so BB's AA is
+half as likely against a BTN holding A5s and a sixth as likely against AA.
+That is what makes an ace the card to 4-bet bluff with. The weights sum to
+one over the class priors, so untouched ranges still reach with probability
+one and the seats' values still add up to the pot. Removal among the
+opponents themselves stays unmodelled.
+
 ## Limits
 
 - Flop sampling noise: K flops per terminal give per-class values with a few
