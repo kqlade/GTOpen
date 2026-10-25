@@ -103,15 +103,25 @@ pub fn combo_index(c1: Card, c2: Card) -> usize {
 }
 
 /// Inverse of `combo_index`: returns (high card, low card).
+#[inline(always)]
 pub fn combo_from_index(idx: usize) -> (Card, Card) {
-    // hi is the largest h with h*(h-1)/2 <= idx
+    COMBO_CARDS[idx]
+}
+
+/// (high card, low card) per combo index, built at compile time.
+const COMBO_CARDS: [(Card, Card); NUM_COMBOS] = {
+    let mut table = [(0u8, 0u8); NUM_COMBOS];
     let mut hi = 1usize;
-    while (hi + 1) * hi / 2 <= idx {
+    while hi < NUM_CARDS {
+        let mut lo = 0usize;
+        while lo < hi {
+            table[hi * (hi - 1) / 2 + lo] = (hi as Card, lo as Card);
+            lo += 1;
+        }
         hi += 1;
     }
-    let lo = idx - hi * (hi - 1) / 2;
-    (hi as Card, lo as Card)
-}
+    table
+};
 
 pub fn combo_to_string(c1: Card, c2: Card) -> String {
     let (hi, lo) = if c1 > c2 { (c1, c2) } else { (c2, c1) };
