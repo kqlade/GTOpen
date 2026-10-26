@@ -718,6 +718,41 @@ pub fn sample_cards(board: &[Card], k: usize) -> (Vec<Card>, Vec<f32>) {
     (cards, weights)
 }
 
+/// [`sample_cards`] with particular cards guaranteed a place: each `fixed`
+/// card not already sampled stands in for a sampled card of its own texture
+/// class (taking its weight, so the sample stays class-weighted); when its
+/// class has no sampled card the card joins with its class's share of the
+/// deck and the other weights shrink to make room.
+pub fn sample_cards_with(board: &[Card], k: usize, fixed: &[Card]) -> (Vec<Card>, Vec<f32>) {
+    let (mut cards, mut weights) = sample_cards(board, k);
+    let deck: Vec<Card> = (0..NUM_CARDS as Card).filter(|c| !board.contains(c)).collect();
+    let class_size = |class: usize| deck.iter().filter(|&&c| card_class(board, c) == class).count();
+    for &f in fixed {
+        if cards.contains(&f) || !deck.contains(&f) {
+            continue;
+        }
+        let class = card_class(board, f);
+        if let Some(i) = cards.iter().position(|&c| card_class(board, c) == class) {
+            cards[i] = f;
+            continue;
+        }
+        let covered: usize = {
+            let mut seen: Vec<usize> = cards.iter().map(|&c| card_class(board, c)).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.into_iter().map(class_size).sum()
+        };
+        let joining = class_size(class);
+        let scale = covered as f32 / (covered + joining) as f32;
+        for w in weights.iter_mut() {
+            *w *= scale;
+        }
+        cards.push(f);
+        weights.push(joining as f32 / (covered + joining) as f32);
+    }
+    (cards, weights)
+}
+
 /// Class-weighted two-card runouts of a flop: `turns` sampled turn cards,
 /// each followed by `rivers` sampled rivers, weights multiplied.
 pub fn sample_runouts(flop: &[Card], turns: usize, rivers: usize) -> Vec<([Card; 5], f32)> {
@@ -1007,5 +1042,39 @@ mod tests {
         for (r, _) in &runouts {
             assert!(!flop.contains(&r[3]) && !flop.contains(&r[4]) && r[3] != r[4]);
         }
+    }
+
+    /// A card asked for stands in for a sampled card of its class, weights
+    /// untouched; when its class was not sampled it joins with the class's
+    /// share of the deck and the rest shrink to keep the sum at one.
+    #[test]
+    fn fixed_cards_join_the_sample_in_their_class() {
+        let flop = parse_cards("Ks7s2d").unwrap();
+        let (cards, weights) = sample_cards(&flop, 8);
+        let qh = parse_cards("Qh").unwrap()[0];
+        assert!(!cards.contains(&qh));
+        let (with, w) = sample_cards_with(&flop, 8, &[qh]);
+        assert_eq!(with.len(), 8);
+        assert!(with.contains(&qh));
+        assert_eq!(w, weights);
+        let swapped = cards.iter().zip(&with).filter(|(a, b)| a != b).count();
+        assert_eq!(swapped, 1);
+        let out = cards.iter().zip(&with).find(|(a, b)| a != b).unwrap().0;
+        assert_eq!(card_class(&flop, *out), card_class(&flop, qh));
+        // already there: nothing changes
+        assert_eq!(sample_cards_with(&flop, 8, &[cards[0]]).0, cards);
+        // two samples take the two biggest classes; an ace (class "over") has to join
+        let (two, _) = sample_cards(&flop, 2);
+        let ah = parse_cards("Ah").unwrap()[0];
+        assert!(two.iter().all(|&c| card_class(&flop, c) != card_class(&flop, ah)));
+        let (three, w3) = sample_cards_with(&flop, 2, &[ah]);
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[2], ah);
+        assert!((w3.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{w3:?}");
+        let size = |c: Card| (0..52u8).filter(|d| !flop.contains(d) && card_class(&flop, *d) == card_class(&flop, c)).count();
+        let covered: usize = three.iter().map(|&c| size(c)).sum();
+        // three aces: the ace of spades is a flush card here
+        assert_eq!(size(ah), 3);
+        assert!((w3[2] - 3.0 / covered as f32).abs() < 1e-6, "{w3:?}: three aces over {covered}");
     }
 }

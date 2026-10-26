@@ -118,10 +118,45 @@ its own timeout, and several can run at once, one thread each):
 
 `seats` are in postflop acting order; `pot` includes the folded seats' money;
 `rake_pct` is a percentage like everywhere else in the API; `weights` are the
-per-combo weights the preflop node view reports (`reaches_all`). The reply
-carries `values` and `masses` per position (169 each), `range_ev` and
-`best_response_ev` per position, `gap_pct` with its history, `iterations`,
-`nodes`, `seconds` and the first seat's action split at the root.
+per-class weights the preflop node view reports (`reaches_all`). A seat may
+give `range` instead — solver notation, `"22+,A2s+,KhQh:0.5"` — which keeps a
+suit-specific read. Raises are sized by `raise_sizes` (multiples of the bet
+faced) and `raise_pot_fractions` (fractions of the pot after the call, the
+heads-up tree's "60%"); both lists are offered, and the turn has its own
+(`turn_raise_sizes`, `turn_raise_pot_fractions`). `turn_cards_fixed` names
+turn cards that must be among the sampled ones; each stands in for a sampled
+card of its texture class. The reply carries `values` and `masses` per
+position (169 each), `range_ev` and `best_response_ev` per position,
+`gap_pct` with its history, `iterations`, `nodes`, `seconds` and the first
+seat's action split at the root.
+
+### Reading the tree back
+
+A `read` in the request returns the solved tree node by node, the way the
+heads-up `POST /api/postflop/solve` does, for a coach to walk:
+
+```json
+"read": {"cards": ["Td"], "lines": 4, "min_reach": 0.001,
+         "paths": [[{"type": "action", "index": 0}, {"type": "action", "index": 1},
+                    {"type": "action", "index": 1}, {"type": "action", "index": 1},
+                    {"type": "card", "card": "Td"}]]}
+```
+
+The flop street comes whole, root to every deal. A turn card in `cards` (one
+at most: the tree ends on the turn) joins the sample as if named in
+`turn_cards_fixed` and is dealt at the `lines` most-taken closing lines plus
+every line in `paths` that reaches a deal; the turn street below it comes
+whole as well. The reply's `views` is a list of `{path, node}`, a parent
+before its children. A node has `node_type` (`action`, `chance`, `fold`,
+`showdown`), `street`, `board`, `pot`, `put` per seat, `player`, `actions`
+(`label`, `kind`, `amount` as a street total) and `players`, one per seat in
+acting order, each a list of hands reaching the node with at least
+`min_reach`: `combo`, `weight` (at the root), `reach`, `valid` (the other
+seats' compatible mass), `ev` (chips owned at the end of the hand, the
+convention of `values`) and, for the seat to act, `strategy` and `evs` per
+action, so `ev = Σ strategy × evs`. `eq` is always null: the solver does not
+price equity per hand. A seat that has folded shows no hands. Reading costs a
+few traversals of the subtree per node, a small share of a real solve.
 
 On the 6-max baseline's BTN-SB-BB single-raised pot the one-street tree (two
 bet sizes, one raise size, two raises, 40 runouts) is 370 nodes and reaches a

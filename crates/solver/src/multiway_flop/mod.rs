@@ -4,17 +4,23 @@
 //! One street from the flop (or the flop and a sampled turn), every seat's
 //! strategy a vector over the 1,326 combos, leaves checked down by exact
 //! showdown over a fixed sample of runouts. CPU only, one solve per call.
+//! Besides the per-class values the preflop engine consumes, a solve can
+//! read back the tree node by node (`read`, view.rs) for a coach to walk.
 
 pub mod showdown;
 pub mod solve;
 pub mod tree;
+pub mod view;
 
 use crate::cards::{cards_to_string, combo_from_index, parse_cards, rank, suit, Card, NUM_COMBOS};
 use crate::preflop::equity::{class_index, NUM_CLASSES};
+use crate::query::PathStep;
+use crate::range::Range;
 use serde::{Deserialize, Serialize};
-use showdown::{sample_cards, sample_runouts, Board};
+use showdown::{sample_cards, sample_cards_with, sample_runouts, Board};
 use solve::Solver;
-use tree::{Builder, TreeConfig};
+use tree::{Builder, TreeConfig, KIND_CHANCE};
+pub use view::{NodeView, SolvedNode};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SeatInput {
@@ -22,8 +28,38 @@ pub struct SeatInput {
     /// Chips this seat put in before the flop.
     pub invested: f64,
     /// Per hand class (engine order): the probability each combo of the
-    /// class takes the line to this flop, in [0, 1].
-    pub weights: Vec<f32>,
+    /// class takes the line to this flop, in [0, 1]. One of `weights` and
+    /// `range`.
+    #[serde(default)]
+    pub weights: Option<Vec<f32>>,
+    /// The range in solver notation ("22+,A2s+,KhQh:0.5"): per combo, so a
+    /// suit-specific read keeps its suits.
+    #[serde(default)]
+    pub range: Option<String>,
+}
+
+/// Which nodes of the solved tree come back. The flop street always comes
+/// whole, root to every deal; a turn card in `cards` is then dealt at the
+/// `lines` most-taken closing lines plus every line in `paths` that reaches
+/// a deal, and the turn street below it comes whole as well.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadRequest {
+    /// The turn to deal (one card at most: the tree ends on the turn). The
+    /// card joins the sampled turn cards as if named in `turn_cards_fixed`.
+    #[serde(default)]
+    pub cards: Vec<String>,
+    #[serde(default = "default_read_lines")]
+    pub lines: usize,
+    #[serde(default)]
+    pub paths: Vec<Vec<PathStep>>,
+    /// Hands reaching a node with less than this probability are left out.
+    #[serde(default)]
+    pub min_reach: f32,
+}
+
+fn default_read_lines() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +86,9 @@ pub struct SolveRequest {
     /// Raise sizes as multiples of the bet faced.
     #[serde(default = "default_raise_sizes")]
     pub raise_sizes: Vec<f64>,
+    /// Raise sizes as fractions of the pot after the call (tree.rs).
+    #[serde(default)]
+    pub raise_pot_fractions: Vec<f64>,
     #[serde(default = "default_max_raises")]
     pub max_raises: u8,
     #[serde(default = "default_allin_threshold")]
@@ -57,12 +96,18 @@ pub struct SolveRequest {
     /// Sampled turn cards to deal (0: the tree ends on the flop).
     #[serde(default)]
     pub turn_cards: usize,
+    /// Turn cards that must be among the sampled ones ("Td"), each standing
+    /// in for a sampled card of its texture class.
+    #[serde(default)]
+    pub turn_cards_fixed: Vec<String>,
     /// Turn bet sizes, raise sizes and raise cap; the flop's when absent
     /// (an empty list: check or call only).
     #[serde(default)]
     pub turn_bet_sizes: Option<Vec<f64>>,
     #[serde(default)]
     pub turn_raise_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub turn_raise_pot_fractions: Option<Vec<f64>>,
     #[serde(default)]
     pub turn_max_raises: Option<u8>,
     /// Board completions each showdown averages over.
@@ -77,6 +122,9 @@ pub struct SolveRequest {
     pub target_gap_pct: f64,
     #[serde(default = "default_max_arena_mb")]
     pub max_arena_mb: f64,
+    /// Nodes to read back after the solve (none: values only).
+    #[serde(default)]
+    pub read: Option<ReadRequest>,
 }
 
 fn default_bet_sizes() -> Vec<f64> {
@@ -144,11 +192,24 @@ pub struct SolveResult {
     pub seats: Vec<SeatResult>,
     /// The first seat's action split at the root.
     pub root_actions: Vec<RootAction>,
+    /// The nodes `read` asked for, a parent before its children (empty
+    /// without a `read`).
+    pub views: Vec<SolvedNode>,
 }
 
 /// Root reach of a seat: its class weights spread over the combos, minus the
 /// ones the board blocks.
 pub fn root_reach(weights: &[f32], board: &[Card]) -> Vec<f32> {
+    let mut per_combo = vec![0f32; NUM_COMBOS];
+    for (idx, slot) in per_combo.iter_mut().enumerate() {
+        let (a, b) = combo_from_index(idx);
+        *slot = weights[class_index(rank(a), rank(b), suit(a) == suit(b))].clamp(0.0, 1.0);
+    }
+    root_reach_combos(&per_combo, board)
+}
+
+/// Root reach of a seat from per-combo weights, minus the combos the board blocks.
+pub fn root_reach_combos(weights: &[f32], board: &[Card]) -> Vec<f32> {
     let mut blocked = 0u64;
     for &c in board {
         blocked |= 1 << c;
@@ -159,9 +220,33 @@ pub fn root_reach(weights: &[f32], board: &[Card]) -> Vec<f32> {
         if blocked & (1 << a) != 0 || blocked & (1 << b) != 0 {
             continue;
         }
-        *slot = weights[class_index(rank(a), rank(b), suit(a) == suit(b))].clamp(0.0, 1.0);
+        *slot = weights[idx].clamp(0.0, 1.0);
     }
     out
+}
+
+/// A seat's root reach from whichever of `weights` and `range` it gives.
+fn seat_reach(seat: &SeatInput, flop: &[Card]) -> Result<Vec<f32>, String> {
+    let reach = match (&seat.weights, &seat.range) {
+        (Some(weights), None) => {
+            if weights.len() != NUM_CLASSES {
+                return Err(format!("{}: weights must have {NUM_CLASSES} entries", seat.position));
+            }
+            if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+                return Err(format!("{}: weights must be finite and not negative", seat.position));
+            }
+            root_reach(weights, flop)
+        }
+        (None, Some(range)) => {
+            let parsed = Range::parse(range).map_err(|e| format!("{}: {e}", seat.position))?;
+            root_reach_combos(&parsed.weights, flop)
+        }
+        _ => return Err(format!("{}: give weights or range, one of the two", seat.position)),
+    };
+    if reach.iter().all(|w| *w <= 0.0) {
+        return Err(format!("{}: the range is empty on this flop", seat.position));
+    }
+    Ok(reach)
 }
 
 pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
@@ -173,15 +258,29 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
     if !(2..=tree::MAX_SEATS).contains(&req.seats.len()) {
         return Err(format!("seats must number 2 to {}", tree::MAX_SEATS));
     }
-    for seat in &req.seats {
-        if seat.weights.len() != NUM_CLASSES {
-            return Err(format!("{}: weights must have {NUM_CLASSES} entries", seat.position));
+    let reach: Vec<Vec<f32>> = req.seats.iter().map(|s| seat_reach(s, &flop)).collect::<Result<_, _>>()?;
+    let mut fixed: Vec<Card> = Vec::new();
+    for text in req.turn_cards_fixed.iter().chain(req.read.iter().flat_map(|r| r.cards.iter())) {
+        let cards = parse_cards(text)?;
+        let [c] = cards[..] else {
+            return Err(format!("{text:?} is not one turn card"));
+        };
+        if flop.contains(&c) {
+            return Err(format!("the turn {text} is on the flop"));
         }
-        if seat.weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
-            return Err(format!("{}: weights must be finite and not negative", seat.position));
+        if !fixed.contains(&c) {
+            fixed.push(c);
         }
-        if seat.weights.iter().all(|w| *w <= 0.0) {
-            return Err(format!("{}: the range is empty", seat.position));
+    }
+    if let Some(read) = &req.read {
+        if read.cards.len() > 1 {
+            return Err("read.cards is the turn alone: the multiway tree ends on the turn".into());
+        }
+        if !read.cards.is_empty() && req.turn_cards == 0 {
+            return Err("read.cards names a turn but turn_cards is 0: no turn is dealt".into());
+        }
+        if read.lines == 0 && read.paths.is_empty() && !read.cards.is_empty() {
+            return Err("read.lines is 0 and read.paths is empty: no line would reach the turn".into());
         }
     }
     if req.runouts == 0 {
@@ -201,14 +300,17 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
         rake_cap: req.rake_cap,
         bet_sizes: req.bet_sizes.clone(),
         raise_sizes: req.raise_sizes.clone(),
+        raise_pot_fractions: req.raise_pot_fractions.clone(),
         max_raises: req.max_raises,
         allin_threshold: req.allin_threshold,
         turn_cards: req.turn_cards,
         turn_bet_sizes: req.turn_bet_sizes.clone(),
         turn_raise_sizes: req.turn_raise_sizes.clone(),
+        turn_raise_pot_fractions: req.turn_raise_pot_fractions.clone(),
         turn_max_raises: req.turn_max_raises,
     };
-    let (turn_cards, turn_weights) = if req.turn_cards > 0 { sample_cards(&flop, req.turn_cards) } else { (Vec::new(), Vec::new()) };
+    let (turn_cards, turn_weights) =
+        if req.turn_cards > 0 { sample_cards_with(&flop, req.turn_cards, &fixed) } else { (Vec::new(), Vec::new()) };
     let max_nodes = (req.max_arena_mb * 1e6 / (8.0 * NUM_COMBOS as f64)) as usize;
     let mut tree = Builder::build(&cfg, turn_cards.clone(), NUM_COMBOS, max_nodes.max(1000))?;
     tree.turn_weights = turn_weights;
@@ -236,7 +338,6 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
                 .collect(),
         );
     }
-    let reach: Vec<Vec<f32>> = req.seats.iter().map(|s| root_reach(&s.weights, &flop)).collect();
     let mut solver = Solver::new(tree, boards, reach);
     let mut gap_history = Vec::new();
     let mut gap_pct = f64::INFINITY;
@@ -298,6 +399,10 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
             },
         })
         .collect();
+    let views = match &req.read {
+        Some(read) => read_tree(&mut solver, &flop, read)?,
+        None => Vec::new(),
+    };
     Ok(SolveResult {
         board: cards_to_string(&flop),
         nodes: solver.tree.nodes.len(),
@@ -311,7 +416,78 @@ pub fn solve(req: &SolveRequest) -> Result<SolveResult, String> {
         seconds: started.elapsed().as_secs_f64(),
         seats,
         root_actions,
+        views,
     })
+}
+
+/// The nodes a read request names, a parent before its children: the flop
+/// street whole, then the turn street under the card at the chosen lines.
+fn read_tree(solver: &mut Solver, flop: &[Card], read: &ReadRequest) -> Result<Vec<SolvedNode>, String> {
+    let mut nodes = Vec::new();
+    let mut deals = Vec::new();
+    read_street(solver, flop, Vec::new(), read.min_reach, &mut nodes, &mut deals)?;
+    if let Some(card) = read.cards.first() {
+        let mut lines: Vec<(Vec<PathStep>, f64)> = deals
+            .drain(..)
+            .map(|path| solver.walk(&path).map(|w| (path, w.frequency)))
+            .collect::<Result<_, _>>()?;
+        lines.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut chosen: Vec<Vec<PathStep>> = lines.into_iter().take(read.lines).map(|(path, _)| path).collect();
+        for path in &read.paths {
+            let line: Vec<PathStep> = path.iter().take_while(|s| matches!(s, PathStep::Action { .. })).cloned().collect();
+            if line.len() == path.len() || chosen.contains(&line) {
+                continue;
+            }
+            let walk = solver.walk(&line)?;
+            if solver.tree.nodes[walk.node].kind != KIND_CHANCE {
+                return Err(format!("read.paths: {} does not end at the deal", path_text(&line)));
+            }
+            chosen.push(line);
+        }
+        for line in chosen {
+            let mut path = line;
+            path.push(PathStep::Card { card: card.clone() });
+            read_street(solver, flop, path, read.min_reach, &mut nodes, &mut deals)?;
+        }
+    }
+    Ok(nodes)
+}
+
+/// Every node of the street below `path` down to the next deal, the deals
+/// met collected for the turn.
+fn read_street(
+    solver: &mut Solver,
+    flop: &[Card],
+    path: Vec<PathStep>,
+    min_reach: f32,
+    nodes: &mut Vec<SolvedNode>,
+    deals: &mut Vec<Vec<PathStep>>,
+) -> Result<(), String> {
+    let node = solver.node_view(flop, &path, min_reach)?;
+    let (kind, actions) = (node.node_type.clone(), node.actions.len());
+    nodes.push(SolvedNode { path: path.clone(), node });
+    match kind.as_str() {
+        "chance" => deals.push(path),
+        "action" => {
+            for index in 0..actions {
+                let mut child = path.clone();
+                child.push(PathStep::Action { index });
+                read_street(solver, flop, child, min_reach, nodes, deals)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn path_text(path: &[PathStep]) -> String {
+    path.iter()
+        .map(|step| match step {
+            PathStep::Action { index } => index.to_string(),
+            PathStep::Card { card } => card.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -333,22 +509,155 @@ mod tests {
             seats,
             bet_sizes: vec![0.5],
             raise_sizes: vec![2.5],
+            raise_pot_fractions: Vec::new(),
             max_raises: 1,
             allin_threshold: 0.65,
             turn_cards: 0,
+            turn_cards_fixed: Vec::new(),
             turn_bet_sizes: None,
             turn_raise_sizes: None,
+            turn_raise_pot_fractions: None,
             turn_max_raises: None,
             runouts: 12,
             iterations: 40,
             check_every: 20,
             target_gap_pct: 0.0,
             max_arena_mb: 1500.0,
+            read: None,
         }
     }
 
     fn seat(position: &str, weights: Vec<f32>) -> SeatInput {
-        SeatInput { position: position.into(), invested: 2.5, weights }
+        SeatInput { position: position.into(), invested: 2.5, weights: Some(weights), range: None }
+    }
+
+    fn ranged(position: &str, range: &str) -> SeatInput {
+        SeatInput { position: position.into(), invested: 2.5, weights: None, range: Some(range.into()) }
+    }
+
+    fn read(cards: &[&str], paths: Vec<Vec<PathStep>>) -> Option<ReadRequest> {
+        Some(ReadRequest { cards: cards.iter().map(|c| c.to_string()).collect(), lines: 2, paths, min_reach: 0.0 })
+    }
+
+    /// The read-back is the solve seen node by node: at every action node
+    /// the actor's strategies sum to one and its EV is the strategy-weighted
+    /// EV of its actions; the live seats' chips owned, weighted by
+    /// reach × valid, add up to the raked pot; a seat given as a range
+    /// string reads the same as the class weights it spells out.
+    #[test]
+    fn reads_the_tree_back_node_by_node() {
+        let mut req = request(
+            vec![seat("SB", uniform(1.0)), seat("BB", uniform(1.0)), ranged("BTN", "22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s,A2o+,K2o+,Q2o+,J2o+,T2o+,92o+,82o+,72o+,62o+,52o+,42o+,32o")],
+            7.5,
+        );
+        req.iterations = 20;
+        req.check_every = 20;
+        req.read = read(&[], Vec::new());
+        let res = solve(&req).unwrap();
+        assert!(res.views.len() > 5, "{} nodes read", res.views.len());
+        let root = &res.views[0];
+        assert!(root.path.is_empty());
+        assert_eq!(root.node.node_type, "action");
+        assert_eq!(root.node.player, Some(0));
+        assert_eq!(root.node.put, vec![2.5; 3]);
+        assert_eq!(root.node.board, vec!["Ks", "7h", "2d"]);
+        assert_eq!(root.node.actions.iter().map(|a| a.kind.as_str()).collect::<Vec<_>>(), ["check", "bet"]);
+        assert_eq!(root.node.actions[1].label, "Bet 3.75 (50%)");
+        // BTN's range string covers every hand: as many combos reach as SB's uniform weights
+        assert_eq!(root.node.players[2].hands.len(), root.node.players[0].hands.len());
+        assert_eq!(root.node.players[0].hands.len(), 1176);
+        let mut owned = 0f64;
+        let mut weight = 0f64;
+        for (p, player) in root.node.players.iter().enumerate() {
+            for h in &player.hands {
+                let w = h.reach as f64 * h.valid as f64;
+                owned += w * h.ev.unwrap() as f64;
+                weight += w;
+                if p == 0 {
+                    let s = h.strategy.as_ref().unwrap();
+                    assert!((s.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{s:?}");
+                    let evs = h.evs.as_ref().unwrap();
+                    let mixed: f32 = s.iter().zip(evs).map(|(p, e)| p * e.unwrap()).sum();
+                    assert!((mixed - h.ev.unwrap()).abs() < 1e-3, "{}: ev {} vs Σσ·evs {mixed}", h.combo, h.ev.unwrap());
+                } else {
+                    assert!(h.strategy.is_none() && h.evs.is_none());
+                }
+                assert!(h.eq.is_none());
+            }
+        }
+        // Three seats share the same reach × valid weight, so the sum over
+        // all of them is three times the pot.
+        assert!((owned / weight * 3.0 - 7.5).abs() < 0.2, "chips owned {}", owned / weight * 3.0);
+        // After SB bets, BB faces fold / call / raise and SB's reach is the betting part of its range.
+        let after_bet = res.views.iter().find(|n| n.path == vec![PathStep::Action { index: 1 }]).unwrap();
+        assert_eq!(after_bet.node.player, Some(1));
+        assert_eq!(after_bet.node.actions.iter().map(|a| a.kind.as_str()).collect::<Vec<_>>(), ["fold", "call", "raise"]);
+        assert_eq!(after_bet.node.put, vec![6.25, 2.5, 2.5]);
+        let sb_bets: f64 = after_bet.node.players[0].hands.iter().map(|h| h.reach as f64).sum();
+        let sb_all: f64 = root.node.players[0].hands.iter().map(|h| h.reach as f64).sum();
+        let bet_freq = root.node.players[0].hands.iter().map(|h| h.reach as f64 * h.strategy.as_ref().unwrap()[1] as f64).sum::<f64>() / sb_all;
+        assert!((sb_bets / sb_all - bet_freq).abs() < 1e-4);
+        // A folded seat shows no hands; the fold-out node names the winner's chips.
+        let sb_folds = res.views.iter().find(|n| n.path == vec![PathStep::Action { index: 1 }, PathStep::Action { index: 0 }, PathStep::Action { index: 0 }]).unwrap();
+        assert_eq!(sb_folds.node.node_type, "fold");
+        assert!(sb_folds.node.players[1].hands.is_empty() && sb_folds.node.players[2].hands.is_empty());
+        let won = sb_folds.node.players[0].hands[0].ev.unwrap();
+        assert!((won - 11.25).abs() < 1e-3, "SB owns {won} after the others fold");
+    }
+
+    /// A turn card asked for is dealt even when the sample would not have
+    /// picked it, and the line asked about is read under it.
+    #[test]
+    fn reads_the_turn_asked_for_along_the_line_asked_for() {
+        let mut req = request(vec![seat("SB", uniform(1.0)), seat("BB", uniform(1.0)), seat("BTN", uniform(1.0))], 7.5);
+        req.turn_cards = 3;
+        req.turn_bet_sizes = Some(vec![]);
+        req.runouts = 3;
+        req.iterations = 2;
+        req.check_every = 2;
+        let check_check_check = vec![PathStep::Action { index: 0 }, PathStep::Action { index: 0 }, PathStep::Action { index: 0 }];
+        let mut line = check_check_check.clone();
+        line.push(PathStep::Card { card: "Qc".into() });
+        req.read = read(&["Qc"], vec![line.clone()]);
+        let res = solve(&req).unwrap();
+        assert!(res.turn_cards.contains(&"Qc".to_string()), "{:?}", res.turn_cards);
+        assert_eq!(res.turn_cards.len(), 3);
+        let deal = res.views.iter().find(|n| n.path == check_check_check).unwrap();
+        assert_eq!(deal.node.node_type, "chance");
+        assert_eq!(deal.node.available_cards.as_ref().unwrap().len(), 3);
+        let turn = res.views.iter().find(|n| n.path == line).unwrap();
+        assert_eq!(turn.node.street, 1);
+        assert_eq!(turn.node.board, vec!["Ks", "7h", "2d", "Qc"]);
+        assert_eq!(turn.node.player, Some(0));
+        // Queens (and every hand with a club queen) cannot be held on this turn.
+        assert!(turn.node.players[1].hands.iter().all(|h| !h.combo.contains("Qc")));
+        // Only `lines` deals come back beyond the one asked for.
+        let turns = res.views.iter().filter(|n| matches!(n.path.last(), Some(PathStep::Card { .. }))).count();
+        assert!((1..=3).contains(&turns), "{turns} turn roots");
+        // Without a card in read.cards the flop street alone comes back, paths or not.
+        req.read = read(&[], vec![line]);
+        let res = solve(&req).unwrap();
+        assert!(res.views.iter().all(|n| !n.path.iter().any(|s| matches!(s, PathStep::Card { .. }))));
+        assert!(res.views.iter().any(|n| n.node.node_type == "chance"));
+    }
+
+    #[test]
+    fn a_range_string_and_its_class_weights_solve_alike() {
+        let mut classes = uniform(0.0);
+        for (hi, lo, suited) in [(12, 12, false), (11, 11, false), (12, 11, true), (12, 11, false)] {
+            classes[class_index(hi, lo, suited)] = 1.0;
+        }
+        let by_class = request(vec![seat("SB", classes), seat("BB", uniform(1.0)), seat("BTN", uniform(1.0))], 7.5);
+        let mut by_range = by_class.clone();
+        by_range.seats[0] = ranged("SB", "AA,KK,AKs,AKo");
+        let (a, b) = (solve(&by_class).unwrap(), solve(&by_range).unwrap());
+        assert!((a.seats[0].range_ev - b.seats[0].range_ev).abs() < 1e-6);
+        assert_eq!(a.seats[0].values, b.seats[0].values);
+        let mut bad = by_class.clone();
+        bad.seats[0] = SeatInput { position: "SB".into(), invested: 2.5, weights: None, range: None };
+        assert!(solve(&bad).unwrap_err().contains("one of the two"));
+        bad.seats[0] = ranged("SB", "KsKd,Ks7h");
+        assert!(solve(&bad).unwrap_err().contains("empty on this flop"));
     }
 
     #[test]

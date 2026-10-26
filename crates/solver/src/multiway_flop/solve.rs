@@ -13,7 +13,7 @@ pub struct Solver {
     pub tree: Tree,
     /// Runout sets: index 0 for flop showdowns, 1 + i under turn card i.
     pub boards: Vec<Vec<Board>>,
-    by_card: Vec<Vec<u16>>,
+    pub(super) by_card: Vec<Vec<u16>>,
     /// Each seat's reach at the root (combos the flop blocks are zero).
     pub root_reach: Vec<Vec<f32>>,
     regrets: Vec<Vec<f32>>,
@@ -24,7 +24,7 @@ pub struct Solver {
 
 /// Which strategy a traversal plays and whether it learns.
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub(super) enum Mode {
     /// Current strategies from regrets; the hero's regrets and strategy sums update.
     Train,
     /// Everyone plays the average strategy.
@@ -118,7 +118,7 @@ impl Solver {
     /// `out[h]` = mass of the other seats' hands compatible with hero combo
     /// `h` and (with two other seats) with each other; more seats are taken
     /// as independent of each other.
-    fn others_mass(&self, hero: usize, reach: &[Vec<f32>], out: &mut [f64]) {
+    pub(super) fn others_mass(&self, hero: usize, reach: &[Vec<f32>], out: &mut [f64]) {
         let others: Vec<usize> = (0..self.tree.seats).filter(|&q| q != hero).collect();
         if let [q1, q2] = others[..] {
             compatible_pair_mass(&reach[q1], &reach[q2], &self.by_card, out);
@@ -166,7 +166,7 @@ impl Solver {
         }
     }
 
-    fn traverse(&mut self, node: usize, hero: usize, reach: &mut Vec<Vec<f32>>, out: &mut [f32], mode: Mode) {
+    pub(super) fn traverse(&mut self, node: usize, hero: usize, reach: &mut Vec<Vec<f32>>, out: &mut [f32], mode: Mode) {
         let nd = &self.tree.nodes[node];
         let seats = self.tree.seats;
         let (kind, actor, live, put_hero, offset, na) =

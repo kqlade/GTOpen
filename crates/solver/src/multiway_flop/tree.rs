@@ -74,6 +74,11 @@ pub struct TreeConfig {
     pub bet_sizes: Vec<f64>,
     /// Raise sizes as multiples of the bet faced (street total).
     pub raise_sizes: Vec<f64>,
+    /// Raise sizes as fractions of the pot after the call (a 0.6 raise over
+    /// a bet b into pot p is to b + 0.6 × (p + 2b)), the way the heads-up
+    /// tree sizes a "60%" raise; both lists are offered.
+    #[serde(default)]
+    pub raise_pot_fractions: Vec<f64>,
     #[serde(default = "default_max_raises")]
     pub max_raises: u8,
     /// A bet or raise committing more than this fraction of the stack
@@ -90,20 +95,39 @@ pub struct TreeConfig {
     #[serde(default)]
     pub turn_raise_sizes: Option<Vec<f64>>,
     #[serde(default)]
+    pub turn_raise_pot_fractions: Option<Vec<f64>>,
+    #[serde(default)]
     pub turn_max_raises: Option<u8>,
 }
 
+/// The sizes offered on a street.
+pub struct StreetSizes<'a> {
+    pub bets: &'a [f64],
+    pub raise_multiples: &'a [f64],
+    pub raise_pot_fractions: &'a [f64],
+    pub max_raises: u8,
+}
+
 impl TreeConfig {
-    /// (bet sizes, raise sizes, raise cap) for a street (0 flop, 1 turn).
-    pub fn street_sizes(&self, street: u8) -> (&[f64], &[f64], u8) {
+    /// The sizes for a street (0 flop, 1 turn).
+    pub fn street_sizes(&self, street: u8) -> StreetSizes<'_> {
         if street == 0 {
-            return (&self.bet_sizes, &self.raise_sizes, self.max_raises);
+            return StreetSizes {
+                bets: &self.bet_sizes,
+                raise_multiples: &self.raise_sizes,
+                raise_pot_fractions: &self.raise_pot_fractions,
+                max_raises: self.max_raises,
+            };
         }
-        (
-            self.turn_bet_sizes.as_deref().unwrap_or(&self.bet_sizes),
-            self.turn_raise_sizes.as_deref().unwrap_or(&self.raise_sizes),
-            self.turn_max_raises.unwrap_or(self.max_raises),
-        )
+        StreetSizes {
+            bets: self.turn_bet_sizes.as_deref().unwrap_or(&self.bet_sizes),
+            raise_multiples: self.turn_raise_sizes.as_deref().unwrap_or(&self.raise_sizes),
+            raise_pot_fractions: self
+                .turn_raise_pot_fractions
+                .as_deref()
+                .unwrap_or(&self.raise_pot_fractions),
+            max_raises: self.turn_max_raises.unwrap_or(self.max_raises),
+        }
     }
 }
 
@@ -218,8 +242,10 @@ impl<'a> Builder<'a> {
             .bet_sizes
             .iter()
             .chain(&cfg.raise_sizes)
+            .chain(&cfg.raise_pot_fractions)
             .chain(cfg.turn_bet_sizes.iter().flatten())
-            .chain(cfg.turn_raise_sizes.iter().flatten());
+            .chain(cfg.turn_raise_sizes.iter().flatten())
+            .chain(cfg.turn_raise_pot_fractions.iter().flatten());
         if sizes.into_iter().any(|s| !(*s > 0.0 && s.is_finite())) {
             return Err("bet and raise sizes must be positive finite numbers".into());
         }
@@ -292,17 +318,22 @@ impl<'a> Builder<'a> {
         let me = st.to_act;
         let behind = self.behind(st, me);
         let facing = st.current_bet - st.street_bet[me];
-        let (bet_sizes, raise_sizes, max_raises) = self.cfg.street_sizes(st.street);
+        let sizes = self.cfg.street_sizes(st.street);
         let mut out = Vec::new();
         if facing > 1e-9 {
             out.push(Action::Fold);
             out.push(Action::Call(st.current_bet.min(st.street_bet[me] + behind)));
-            if behind > facing + 1e-9 && st.raises < max_raises {
+            if behind > facing + 1e-9 && st.raises < sizes.max_raises {
                 let max_to = st.street_bet[me] + behind;
                 let min_to = st.current_bet + st.last_increment.max(1e-9);
+                let pot_after_call = self.pot(st) + facing;
+                let candidates = sizes
+                    .raise_multiples
+                    .iter()
+                    .map(|m| st.current_bet * m)
+                    .chain(sizes.raise_pot_fractions.iter().map(|f| st.current_bet + f * pot_after_call));
                 let mut tos: Vec<f64> = Vec::new();
-                for m in raise_sizes {
-                    let mut to = st.current_bet * m;
+                for mut to in candidates {
                     if to < min_to {
                         to = min_to;
                     }
@@ -321,7 +352,7 @@ impl<'a> Builder<'a> {
                 let pot = self.pot(st);
                 let max_to = st.street_bet[me] + behind;
                 let mut tos: Vec<f64> = Vec::new();
-                for f in bet_sizes {
+                for f in sizes.bets {
                     let mut to = st.street_bet[me] + f * pot;
                     let committed = st.put[me] - st.street_bet[me] + to - self.cfg.invested[me];
                     if to >= max_to - 1e-9 || committed >= self.cfg.allin_threshold * self.cfg.stack - 1e-9 {
@@ -504,13 +535,39 @@ mod tests {
             rake_cap: 8.0,
             bet_sizes: vec![0.33, 0.75],
             raise_sizes: vec![2.5],
+            raise_pot_fractions: Vec::new(),
             max_raises: 2,
             allin_threshold: 0.65,
             turn_cards: 0,
             turn_bet_sizes: None,
             turn_raise_sizes: None,
+            turn_raise_pot_fractions: None,
             turn_max_raises: None,
         }
+    }
+
+    /// A pot-fraction raise is sized on the pot after the call, like the
+    /// heads-up tree's "60%": over a 33% bet of a 7.5 pot (2.475, pot after
+    /// the call 12.45) a 0.6 raise is to 2.475 + 7.47 = 9.945.
+    #[test]
+    fn pot_fraction_raises_size_on_the_pot_after_the_call() {
+        let mut c = cfg(3);
+        c.raise_sizes = Vec::new();
+        c.raise_pot_fractions = vec![0.6];
+        let tree = Builder::build(&c, Vec::new(), 1326, 1_000_000).unwrap();
+        let root = &tree.nodes[0];
+        let bet = root.actions.iter().position(|a| matches!(a, Action::Bet(to) if (to - 2.475).abs() < 1e-6)).unwrap();
+        let facing = &tree.nodes[root.children[bet] as usize];
+        let raises: Vec<f64> = facing.actions.iter().filter_map(|a| if let Action::Raise(to) = a { Some(*to) } else { None }).collect();
+        assert_eq!(raises.len(), 1, "{:?}", facing.actions);
+        assert!((raises[0] - 9.945).abs() < 1e-6, "{}", raises[0]);
+        // Both lists offered together: the multiple (2.5 × 2.475) and the fraction.
+        c.raise_sizes = vec![2.5];
+        let tree = Builder::build(&c, Vec::new(), 1326, 1_000_000).unwrap();
+        let facing = &tree.nodes[tree.nodes[0].children[bet] as usize];
+        let raises: Vec<f64> = facing.actions.iter().filter_map(|a| if let Action::Raise(to) = a { Some(*to) } else { None }).collect();
+        assert_eq!(raises.len(), 2, "{:?}", facing.actions);
+        assert!((raises[0] - 6.1875).abs() < 1e-6 && (raises[1] - 9.945).abs() < 1e-6, "{raises:?}");
     }
 
     #[test]
