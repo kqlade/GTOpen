@@ -10,7 +10,7 @@ use solver::game::{Spot, SpotConfig};
 use solver::query::PathStep;
 use solver::range::Range;
 use solver::store::Storage;
-use solver::tree::{parse_sizes, StreetSizing, TreeConfig};
+use solver::tree::{parse_sizes, StreetSizing, TreeConfig, KIND_CHANCE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +26,8 @@ mod preflop_preview_tests;
 
 #[cfg(test)]
 mod postflop_context_tests;
+#[cfg(test)]
+mod postflop_solve_tests;
 
 fn bad_request(msg: impl Into<String>) -> ApiError {
     (StatusCode::BAD_REQUEST, msg.into())
@@ -199,7 +201,7 @@ struct Session {
     lock_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 struct TreeInfo {
     nodes: usize,
     action_nodes: usize,
@@ -657,6 +659,49 @@ fn default_check_every() -> u32 {
     20
 }
 
+impl Default for SolveRequest {
+    fn default() -> Self {
+        SolveRequest {
+            max_iterations: default_max_iterations(),
+            target_exploit_pct: default_target(),
+            check_every: default_check_every(),
+            algorithm: None,
+        }
+    }
+}
+
+/// Whether the solver may switch to `algo` within the RAM cap. PCFR+ allocates
+/// a third, regret-sized arena pair on its first iteration — outside the
+/// build-time gate, which sized the spot for two — so a spot admitted near the
+/// limit could otherwise grow 50% past it mid-solve and take the server down.
+/// Returns what the arenas will hold (MB) when the switch allocates them.
+fn admit_algorithm(solver: &Solver, algo: Algorithm) -> Result<Option<f64>, String> {
+    if algo != Algorithm::PcfrPlus || solver.has_preds() {
+        return Ok(None);
+    }
+    let extra_mb = solver.spot.pred_bytes_for(solver.storage, algo) as f64 / 1e6;
+    let have_mb = solver.arena_bytes() as f64 / 1e6;
+    let tree_mb = solver.spot.tree_bytes() as f64 / 1e6;
+    let cap_mb = mem_cap_mb();
+    // same accounting as the build gate: a manual cap is an absolute budget
+    // for arenas + tree; the dynamic cap is 80% of what is free NOW (the
+    // current arenas already came out of it)
+    let over = if mem_cap_is_manual() {
+        have_mb + tree_mb + extra_mb > cap_mb
+    } else {
+        extra_mb > cap_mb
+    };
+    if over {
+        return Err(format!(
+            "pcfr+ needs another {extra_mb:.0} MB of prediction arenas ({:.0} MB with the \
+             tree, 1.5x the DCFR footprint) — over the RAM cap ({cap_mb:.0} MB); use dcfr or \
+             cfr+, or set SOLVER_MEM_MB to override",
+            have_mb + tree_mb + extra_mb
+        ));
+    }
+    Ok(Some(have_mb + extra_mb))
+}
+
 async fn start_solve(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SolveRequest>,
@@ -676,36 +721,11 @@ async fn start_solve(
     if let Some(name) = &req.algorithm {
         let algo = Algorithm::parse(name).map_err(bad_request)?;
         let mut solver = lock_unpoisoned(&session.solver);
-        // PCFR+ allocates a third, regret-sized arena pair on its first
-        // iteration — outside the build-time gate, which sized the spot for
-        // two. Re-check the cap here so a spot admitted near the limit can't
-        // grow 50% past it on the worker thread and take the server down.
-        if algo == Algorithm::PcfrPlus && !solver.has_preds() {
-            let storage = solver.storage;
-            let extra_mb = solver.spot.pred_bytes_for(storage, algo) as f64 / 1e6;
-            let have_mb = solver.arena_bytes() as f64 / 1e6;
-            let tree_mb = solver.spot.tree_bytes() as f64 / 1e6;
-            let cap_mb = mem_cap_mb();
-            // same accounting as the build gate: a manual cap is an absolute
-            // budget for arenas + tree; the dynamic cap is 80% of what is
-            // free NOW (the current arenas already came out of it)
-            let over = if mem_cap_is_manual() {
-                have_mb + tree_mb + extra_mb > cap_mb
-            } else {
-                extra_mb > cap_mb
-            };
-            if over {
-                return Err(bad_request(format!(
-                    "pcfr+ needs another {extra_mb:.0} MB of prediction arenas ({:.0} MB with the \
-                     tree, 1.5x the DCFR footprint) — over the RAM cap ({cap_mb:.0} MB); use dcfr or \
-                     cfr+, or set SOLVER_MEM_MB to override",
-                    have_mb + tree_mb + extra_mb
-                )));
-            }
+        if let Some(held_mb) = admit_algorithm(&solver, algo).map_err(bad_request)? {
             drop(solver);
             // the status readout's "RAM" must show what the solve will hold
             if let Some(t) = state.status.lock().unwrap().tree.as_mut() {
-                t.arena_mb = t.arena_mb.max(have_mb + extra_mb);
+                t.arena_mb = t.arena_mb.max(held_mb);
             }
             solver = lock_unpoisoned(&session.solver);
         }
@@ -1036,6 +1056,271 @@ async fn get_node(
     .map_err(|e| bad_request(e.to_string()))?
     .map_err(bad_request)?;
     Ok(Json(view))
+}
+
+// ---------------------------------------------------------------------------
+// One-shot postflop solve: build, solve and read back in a single request
+// ---------------------------------------------------------------------------
+
+/// `POST /api/postflop/solve`: the spot to build, how far to solve it and
+/// what to read back. Nothing touches the browse session; several requests
+/// can run at once (the GPU takes them one at a time).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostflopSolveRequest {
+    spot: SpotRequest,
+    #[serde(default)]
+    solve: SolveRequest,
+    #[serde(default)]
+    read: ReadRequest,
+}
+
+/// Which nodes of the solved tree come back. The flop street always comes
+/// whole: every node from the root down to each deal. Each card in `cards`
+/// is then dealt at the previous street's closing lines — the `lines` most
+/// taken, plus every line in `paths` that reaches that deal — and the street
+/// below it comes whole as well.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRequest {
+    /// The turn, and then the river, to deal: `["Td"]` or `["Td", "2c"]`.
+    #[serde(default)]
+    cards: Vec<String>,
+    /// How many closing lines of a street, most taken first, are walked into
+    /// the next card.
+    #[serde(default = "default_read_lines")]
+    lines: usize,
+    /// Lines walked into the next card whatever their frequency. Each is a
+    /// path from the root; for the n-th card its prefix before the n-th deal
+    /// is the line used, so one path can name the lines of both cards.
+    #[serde(default)]
+    paths: Vec<Vec<PathStep>>,
+    /// Hands reaching a node with less than this probability are left out
+    /// of its view (0 keeps every hand).
+    #[serde(default)]
+    min_reach: f32,
+}
+
+fn default_read_lines() -> usize {
+    4
+}
+
+impl Default for ReadRequest {
+    fn default() -> Self {
+        ReadRequest {
+            cards: Vec::new(),
+            lines: default_read_lines(),
+            paths: Vec::new(),
+            min_reach: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SolvedNode {
+    path: Vec<PathStep>,
+    node: solver::query::NodeView,
+}
+
+#[derive(Debug, Serialize)]
+struct PostflopSolveResult {
+    iterations: u32,
+    exploit_pct: f64,
+    seconds: f64,
+    /// "gpu" or "cpu": a one-shot solve never hides which one it ran on.
+    engine: &'static str,
+    tree: TreeInfo,
+    nodes: Vec<SolvedNode>,
+}
+
+/// One GPU solve at a time per process: each sizes itself against the card's
+/// free VRAM, so two at once would starve each other mid-solve.
+static GPU_LOCK: Mutex<()> = Mutex::new(());
+
+async fn postflop_solve(
+    Json(req): Json<PostflopSolveRequest>,
+) -> Result<Json<PostflopSolveResult>, ApiError> {
+    let config = req.spot.to_spot_config().map_err(bad_request)?;
+    if req.read.cards.len() > 2 {
+        return Err(bad_request("read.cards is the turn and then the river: two cards at most"));
+    }
+    if req.read.lines == 0 && req.read.paths.is_empty() && !req.read.cards.is_empty() {
+        return Err(bad_request("read.lines is 0 and read.paths is empty: no line would reach the cards"));
+    }
+    // No old-arena credit: the request shares the machine with whatever else
+    // is running (the browse session, other one-shot solves) and frees nothing.
+    let storage = storage_from_env();
+    let cap_mb = mem_cap_mb();
+    let node_cap = node_budget(cap_mb, &config, storage);
+    let result = tokio::task::spawn_blocking(move || {
+        solve_postflop(config, storage, cap_mb, node_cap, &req.solve, &req.read)
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?
+    .map_err(bad_request)?;
+    Ok(Json(result))
+}
+
+/// Build, solve and read back a spot on the calling thread.
+fn solve_postflop(
+    config: SpotConfig,
+    storage: Storage,
+    cap_mb: f64,
+    node_cap: usize,
+    solve: &SolveRequest,
+    read: &ReadRequest,
+) -> Result<PostflopSolveResult, String> {
+    let start = std::time::Instant::now();
+    let spot = Spot::new_with_limit(config, Some(node_cap))?;
+    let arena_mb = spot.arena_bytes_for(storage) as f64 / 1e6;
+    let tree_mb = spot.tree_bytes() as f64 / 1e6;
+    if arena_mb + tree_mb > cap_mb {
+        return Err(format!(
+            "tree too large ({arena_mb:.0} MB of solver data + {tree_mb:.0} MB of tree, cap {cap_mb:.0} MB); \
+             reduce bet sizes or set SOLVER_MEM_MB to override"
+        ));
+    }
+    let tree = tree_info(&spot, arena_mb);
+    let mut solver = Solver::with_storage(Arc::new(spot), storage);
+    if let Some(name) = &solve.algorithm {
+        let algo = Algorithm::parse(name)?;
+        admit_algorithm(&solver, algo)?;
+        solver.algo = algo;
+    }
+    let (iterations, exploit_pct, engine) = solve_once(&mut solver, solve)?;
+    solver.ensure_symmetric();
+    let nodes = read_tree(&solver, read)?;
+    Ok(PostflopSolveResult {
+        iterations,
+        exploit_pct,
+        seconds: start.elapsed().as_secs_f64(),
+        engine,
+        tree,
+        nodes,
+    })
+}
+
+/// Solve to the request's target or iteration budget: on the GPU when it is
+/// compiled in and enabled — a GPU that cannot take the spot is an error here,
+/// not a silent crawl on the CPU — and on the CPU otherwise.
+fn solve_once(solver: &mut Solver, req: &SolveRequest) -> Result<(u32, f64, &'static str), String> {
+    let pot = solver.spot.tree.config.starting_pot;
+    let check_every = req.check_every.max(1);
+    let finished = |it: u32, pct: f64| pct <= req.target_exploit_pct || it >= req.max_iterations;
+    #[cfg(feature = "gpu")]
+    if gpu_enabled() {
+        let _gpu = lock_unpoisoned(&GPU_LOCK);
+        let cap_mb = gpu_budget().0;
+        let mut gpu = solver::gpu::GpuSolver::new_with_budget(solver, cap_mb * 1_000_000)
+            .map_err(|e| format!("the spot does not fit the GPU: {e}"))?;
+        loop {
+            gpu.iterate()?;
+            let it = gpu.iteration;
+            if it % check_every == 0 || it >= req.max_iterations {
+                let pct = gpu.exploitability(solver)? / pot * 100.0;
+                if finished(it, pct) {
+                    gpu.sync_to_cpu(solver)?;
+                    return Ok((it, pct, "gpu"));
+                }
+            }
+        }
+    }
+    let _ = &GPU_LOCK;
+    loop {
+        solver.iterate();
+        let it = solver.iteration;
+        if it % check_every == 0 || it >= req.max_iterations {
+            let pct = solver.exploitability() / pot * 100.0;
+            if finished(it, pct) {
+                return Ok((it, pct, "cpu"));
+            }
+        }
+    }
+}
+
+/// The nodes a read request names, in walk order (a parent before its children).
+fn read_tree(solver: &Solver, read: &ReadRequest) -> Result<Vec<SolvedNode>, String> {
+    let mut nodes = Vec::new();
+    let mut deals = Vec::new();
+    read_street(solver, Vec::new(), read.min_reach, &mut nodes, &mut deals)?;
+    for (street, card) in read.cards.iter().enumerate() {
+        let mut lines: Vec<(Vec<PathStep>, f64)> = deals
+            .drain(..)
+            .map(|path| solver.line_frequency(&path).map(|f| (path, f)))
+            .collect::<Result<_, _>>()?;
+        lines.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut chosen: Vec<Vec<PathStep>> =
+            lines.into_iter().take(read.lines).map(|(path, _)| path).collect();
+        for path in &read.paths {
+            let Some(line) = deal_prefix(path, street) else { continue };
+            if chosen.contains(&line) {
+                continue;
+            }
+            let walk = solver.walk_path(&line)?;
+            if solver.spot.tree.nodes[walk.node_idx as usize].kind != KIND_CHANCE {
+                return Err(format!("read.paths: {} does not end at a deal", path_text(&line)));
+            }
+            chosen.push(line);
+        }
+        for line in chosen {
+            let mut path = line;
+            path.push(PathStep::Card { card: card.clone() });
+            read_street(solver, path, read.min_reach, &mut nodes, &mut deals)?;
+        }
+    }
+    Ok(nodes)
+}
+
+/// Every node of the street below `path`, down to the next deal; the deals
+/// met are collected for the next card.
+fn read_street(
+    solver: &Solver,
+    path: Vec<PathStep>,
+    min_reach: f32,
+    nodes: &mut Vec<SolvedNode>,
+    deals: &mut Vec<Vec<PathStep>>,
+) -> Result<(), String> {
+    let mut node = solver.node_view(&path)?;
+    if min_reach > 0.0 {
+        for player in node.players.iter_mut() {
+            player.hands.retain(|h| h.reach >= min_reach);
+        }
+    }
+    let kind = node.node_type.clone();
+    let actions = node.actions.len();
+    nodes.push(SolvedNode { path: path.clone(), node });
+    match kind.as_str() {
+        "chance" => deals.push(path),
+        "action" => {
+            for index in 0..actions {
+                let mut child = path.clone();
+                child.push(PathStep::Action { index });
+                read_street(solver, child, min_reach, nodes, deals)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The line a path takes into its `street`-th deal (0 = the turn): the prefix
+/// before that card step, or None when the path never deals that far.
+fn deal_prefix(path: &[PathStep], street: usize) -> Option<Vec<PathStep>> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, step)| matches!(step, PathStep::Card { .. }))
+        .nth(street)
+        .map(|(at, _)| path[..at].to_vec())
+}
+
+fn path_text(path: &[PathStep]) -> String {
+    path.iter()
+        .map(|step| match step {
+            PathStep::Action { index } => index.to_string(),
+            PathStep::Card { card } => card.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ---------------------------------------------------------------------------
@@ -3583,6 +3868,11 @@ async fn main() {
         .route("/api/saves", get(list_saves))
         .route("/api/presets", get(get_presets))
         .route("/api/multiway-flop/solve", post(multiway_flop_solve))
+        // the reply carries whole streets of per-hand views: tens of megabytes before gzip
+        .route(
+            "/api/postflop/solve",
+            post(postflop_solve).layer(tower_http::compression::CompressionLayer::new()),
+        )
         .route("/api/preflop/spot", post(pf_build))
         .route("/api/preflop/estimate", post(pf_estimate))
         .route("/api/preflop/solve", post(pf_solve))

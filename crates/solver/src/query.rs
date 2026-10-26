@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::contextual_postflop::{BettingKind, ContextualBetCell, ContextualBetting, PostflopPotType, ProfileRootEvidence};
 use crate::contextual_postflop::{adjust_betting, BettingHistory};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PathStep {
     #[serde(rename = "action")]
@@ -363,6 +363,37 @@ impl Solver {
             reach,
             dealt,
         })
+    }
+
+    /// How often both players take a line: the product, over its action steps,
+    /// of the share of the acting range (by reach) that takes the action. Deals
+    /// are not choices and contribute nothing; the root is 1.
+    pub fn line_frequency(&self, path: &[PathStep]) -> Result<f64, String> {
+        let spot = &*self.spot;
+        let mut frequency = 1.0f64;
+        for (depth, step) in path.iter().enumerate() {
+            if let PathStep::Action { index } = step {
+                let walk = self.walk_path(&path[..depth])?;
+                let node = &spot.tree.nodes[walk.node_idx as usize];
+                if node.kind != KIND_ACTION {
+                    return Err("path step does not match node type".to_string());
+                }
+                if *index >= node.num_children as usize {
+                    return Err(format!("action index {index} out of range"));
+                }
+                let p = node.player as usize;
+                let nh = spot.hands[p].len();
+                let sigma = self.average_strategy(walk.node_idx, node);
+                let weight: f64 = walk.reach[p].iter().map(|&r| r as f64).sum();
+                let taken: f64 = (0..nh)
+                    .map(|i| walk.reach[p][i] as f64 * sigma[index * nh + i] as f64)
+                    .sum();
+                if weight > 0.0 {
+                    frequency *= taken / weight;
+                }
+            }
+        }
+        Ok(frequency)
     }
 
     /// Labeled views of an action node's actions (empty for other node kinds).

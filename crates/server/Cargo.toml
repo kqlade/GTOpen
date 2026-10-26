@@ -12,7 +12,7 @@ solver = { path = "../solver" }
 rayon = "1.10"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

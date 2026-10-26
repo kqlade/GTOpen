@@ -211,6 +211,26 @@ Preflop lab: `POST /api/preflop/spot {config}`, `POST /api/preflop/solve`,
 snapshots: config, seat models, point locks, full solver state — loading
 resumes mid-convergence).
 
+One-shot postflop solve, for callers that want an answer rather than a
+session: `POST /api/postflop/solve {spot, solve, read}` builds the spot (the
+`POST /api/spot` body), solves it (the `POST /api/solve` body; defaults
+apply) and replies with the tree read back, all in one request, without
+touching the browse session. `read` says what comes back: the flop street
+always comes whole (every node from the root to each deal); each card in
+`read.cards` (`["Td"]`, or `["Td","2c"]` for turn and river) is dealt at the
+previous street's `read.lines` most-taken closing lines (default 4) plus any
+line in `read.paths` that reaches that deal, and the street below it comes
+whole too; `read.min_reach` leaves hands reaching a node below that
+probability out of its view. The reply is `{iterations, exploit_pct, seconds,
+engine: "gpu"|"cpu", tree, nodes: [{path, node}]}` with `node` the
+`POST /api/node` view; it is gzipped when the request accepts it (a solved
+single-raised pot with turn and river is some 20 MB of JSON, 5 MB gzipped).
+Several requests may run at once; the GPU takes them one at a time, and a
+spot the GPU cannot hold is an error rather than a fallback to the CPU
+(on a build without the `gpu` feature the CPU solves it). The call takes as
+long as the solve does — minutes on a GPU for the full tree — so the caller
+sets its own timeout.
+
 Path steps: `{"type":"action","index":0}` / `{"type":"card","card":"Ah"}`.
 Browse deep links: `/#line=a1,a1,cQh` opens BROWSE at that node (`a<i>` =
 action index, `c<card>` = dealt card).
