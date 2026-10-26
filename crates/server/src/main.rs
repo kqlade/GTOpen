@@ -1494,7 +1494,7 @@ async fn pf_estimate(
 /// Solve one multiway flop (three or more seats) and return every seat's
 /// per-class values: the measuring tool behind the preflop engine's multiway
 /// leaf values (docs/multiway_flop_solver.md). Synchronous and stateless;
-/// several can run at once, one thread each.
+/// each solve spreads its showdowns over the rayon pool.
 async fn multiway_flop_solve(
     Json(req): Json<solver::multiway_flop::SolveRequest>,
 ) -> Result<Json<solver::multiway_flop::SolveResult>, ApiError> {

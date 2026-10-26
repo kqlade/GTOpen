@@ -19,7 +19,6 @@ pub struct Solver {
     regrets: Vec<Vec<f32>>,
     strategy_sum: Vec<Vec<f32>>,
     pub iteration: u32,
-    scratch: Vec<f32>,
 }
 
 /// Which strategy a traversal plays and whether it learns.
@@ -45,7 +44,6 @@ impl Solver {
             regrets,
             strategy_sum,
             iteration: 0,
-            scratch: Vec::new(),
         }
     }
 
@@ -193,10 +191,8 @@ impl Solver {
                 let live_opps: Vec<usize> = (0..seats).filter(|&q| q != hero && live & (1 << q) != 0).collect();
                 let folded: Vec<usize> = (0..seats).filter(|&q| q != hero && live & (1 << q) == 0).collect();
                 let boards = std::mem::take(&mut self.boards[set]);
-                let mut scratch = std::mem::take(&mut self.scratch);
-                showdown(&boards, drawn, hero, &live_opps, &folded, reach, pot_eff, put_hero, out, &mut scratch);
+                showdown(&boards, drawn, hero, &live_opps, &folded, reach, pot_eff, put_hero, out);
                 self.boards[set] = boards;
-                self.scratch = scratch;
             }
             KIND_CHANCE => {
                 // the turn card comes from the deck every seat's hand leaves (showdown.rs `sample_weight`)

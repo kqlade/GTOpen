@@ -27,6 +27,7 @@
 
 use crate::cards::{combo_from_index, rank, suit, Card, NUM_CARDS, NUM_COMBOS};
 use crate::evaluator::evaluate7;
+use rayon::prelude::*;
 
 /// Per-card lists of the combos holding that card, in combo-index order.
 pub fn combos_by_card() -> Vec<Vec<u16>> {
@@ -249,6 +250,10 @@ pub fn sample_weight(unseen: usize, others: usize, drawn: usize) -> f64 {
 /// `others(h)` is the mass of the other seats' hands compatible with `h` on
 /// that board, scaled by `sample_weight` for the `drawn` cards the boards
 /// add to the leaf's.
+///
+/// The boards are independent given the ranges and are nearly all of a
+/// solve's work (a flop street's time is linear in the runouts), so they are
+/// evaluated across the cores and their sums combined.
 #[allow(clippy::too_many_arguments)]
 pub fn showdown(
     boards: &[Board],
@@ -260,39 +265,77 @@ pub fn showdown(
     pot_eff: f64,
     put_hero: f64,
     out: &mut [f32],
-    scratch: &mut Vec<f32>,
 ) {
     debug_assert!(hero < reach.len());
-    let m = live.len();
-    let subsets = 1usize << m;
-    // Each board contributes to the combos it leaves valid; weighted average per combo.
-    let mut norm = [0f32; NUM_COMBOS];
-    let mut acc = vec![0f64; NUM_COMBOS];
     let seats = live.len() + folded.len();
     let weight = sample_weight(52 - (5 - drawn) - 2, seats, drawn);
-    if seats == 2 {
-        let mut pair = Pair::new();
-        for board in boards {
-            pair.showdown(board, live, folded, reach, pot_eff, put_hero, &mut acc, &mut norm, scratch);
+    // Each board contributes to the combos it leaves valid; weighted average per combo.
+    let (acc, norm) = boards
+        .par_iter()
+        .fold(
+            || Partial::new(seats),
+            |mut partial, board| {
+                partial.add(board, live, folded, reach, pot_eff, put_hero);
+                partial
+            },
+        )
+        .map(|partial| (partial.acc, partial.norm))
+        .reduce(
+            || (vec![0f64; NUM_COMBOS], vec![0f32; NUM_COMBOS]),
+            |(mut acc, mut norm), (acc2, norm2)| {
+                for h in 0..NUM_COMBOS {
+                    acc[h] += acc2[h];
+                    norm[h] += norm2[h];
+                }
+                (acc, norm)
+            },
+        );
+    for h in 0..NUM_COMBOS {
+        if norm[h] > 0.0 {
+            out[h] += (acc[h] * weight / norm[h] as f64) as f32;
         }
-        for h in 0..NUM_COMBOS {
-            if norm[h] > 0.0 {
-                out[h] += (acc[h] * weight / norm[h] as f64) as f32;
-            }
-        }
-        return;
     }
-    let mut lt = vec![0f32; m];
-    let mut eq = vec![0f32; m];
-    for board in boards {
+}
+
+/// One worker's running sums over the boards it is given, with its own
+/// scratch space.
+struct Partial {
+    /// Exact two-seat showdowns; the general loop serves three or more.
+    pair: Option<Pair>,
+    scratch: Vec<f32>,
+    acc: Vec<f64>,
+    norm: Vec<f32>,
+}
+
+impl Partial {
+    fn new(seats: usize) -> Partial {
+        Partial {
+            pair: (seats == 2).then(Pair::new),
+            scratch: Vec::new(),
+            acc: vec![0f64; NUM_COMBOS],
+            norm: vec![0f32; NUM_COMBOS],
+        }
+    }
+
+    fn add(&mut self, board: &Board, live: &[usize], folded: &[usize], reach: &[Vec<f32>], pot_eff: f64, put_hero: f64) {
+        if let Some(pair) = &mut self.pair {
+            pair.showdown(board, live, folded, reach, pot_eff, put_hero, &mut self.acc, &mut self.norm, &mut self.scratch);
+            return;
+        }
+        let m = live.len();
+        let seats = m + folded.len();
+        let subsets = 1usize << m;
+        let mut lt = vec![0f32; m];
+        let mut eq = vec![0f32; m];
         let stride = board.scratch_len();
+        let scratch = &mut self.scratch;
         scratch.resize(stride * seats, 0.0);
         for (k, &q) in live.iter().chain(folded).enumerate() {
             board.prefixes(&reach[q], &mut scratch[k * stride..(k + 1) * stride]);
         }
         for &h in &board.order {
             let h = h as usize;
-            norm[h] += board.weight;
+            self.norm[h] += board.weight;
             let mut others = 1f64;
             for (k, &q) in live.iter().enumerate() {
                 let (l, e, t) = board.against(h, reach[q][h], &scratch[k * stride..(k + 1) * stride]);
@@ -315,12 +358,7 @@ pub fn showdown(
                 share += term / (s.count_ones() as f64 + 1.0);
             }
             share *= folded_mass;
-            acc[h] += board.weight as f64 * (share * pot_eff - put_hero * others);
-        }
-    }
-    for h in 0..NUM_COMBOS {
-        if norm[h] > 0.0 {
-            out[h] += (acc[h] * weight / norm[h] as f64) as f32;
+            self.acc[h] += board.weight as f64 * (share * pot_eff - put_hero * others);
         }
     }
 }
@@ -443,7 +481,7 @@ impl Pair {
         pot_eff: f64,
         put_hero: f64,
         acc: &mut [f64],
-        norm: &mut [f32; NUM_COMBOS],
+        norm: &mut [f32],
         scratch: &mut Vec<f32>,
     ) {
         let seats: [usize; 2] = match (live, folded) {
@@ -869,8 +907,7 @@ mod tests {
         let b = board("Ks7h2d9c9s");
         let reach = structured_reach(&b);
         let mut out = vec![0f32; NUM_COMBOS];
-        let mut scratch = Vec::new();
-        showdown(std::slice::from_ref(&b), 0, 0, &[1, 2], &[], &reach, 100.0, 10.0, &mut out, &mut scratch);
+        showdown(std::slice::from_ref(&b), 0, 0, &[1, 2], &[], &reach, 100.0, 10.0, &mut out);
         check(&b, &out, &reach, &[1, 2], &[], true);
         // The independent model is measurably different: the test has teeth.
         let (share, mass) = brute(&b, 5 * 37, &reach, &[1, 2], &[], false);
@@ -883,8 +920,7 @@ mod tests {
         let b = board("Ks7h2d9c9s");
         let reach = structured_reach(&b);
         let mut out = vec![0f32; NUM_COMBOS];
-        let mut scratch = Vec::new();
-        showdown(std::slice::from_ref(&b), 0, 0, &[1], &[2], &reach, 100.0, 10.0, &mut out, &mut scratch);
+        showdown(std::slice::from_ref(&b), 0, 0, &[1], &[2], &reach, 100.0, 10.0, &mut out);
         check(&b, &out, &reach, &[1], &[2], true);
     }
 
@@ -893,8 +929,7 @@ mod tests {
         let b = board("Ks7h2d9c9s");
         let reach = structured_reach(&b);
         let mut out = vec![0f32; NUM_COMBOS];
-        let mut scratch = Vec::new();
-        showdown(std::slice::from_ref(&b), 0, 0, &[1, 3], &[2], &reach, 100.0, 10.0, &mut out, &mut scratch);
+        showdown(std::slice::from_ref(&b), 0, 0, &[1, 3], &[2], &reach, 100.0, 10.0, &mut out);
         check(&b, &out, &reach, &[1, 3], &[2], false);
     }
 
@@ -926,12 +961,11 @@ mod tests {
         let b = board("Ks7h2d9c9s");
         let reach = structured_reach(&b);
         let mut out = vec![0f32; NUM_COMBOS];
-        let mut scratch = Vec::new();
         for (live, folded) in [(vec![1usize, 2usize], vec![]), (vec![1], vec![2]), (vec![1], vec![]), (vec![1, 2], vec![3])] {
             let n = 200;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                showdown(std::slice::from_ref(&b), 0, 0, &live, &folded, &reach, 100.0, 10.0, &mut out, &mut scratch);
+                showdown(std::slice::from_ref(&b), 0, 0, &live, &folded, &reach, 100.0, 10.0, &mut out);
             }
             let per = start.elapsed().as_secs_f64() / n as f64;
             println!("live {live:?} folded {folded:?}: {:.1} us per board-hero, {:.2} us per hero combo", per * 1e6, per * 1e6 / b.order.len() as f64);
@@ -967,10 +1001,9 @@ mod tests {
         }
         let mut hu = vec![0f32; NUM_COMBOS];
         let mut with_folded = vec![0f32; NUM_COMBOS];
-        let mut scratch = Vec::new();
         let boards = [b];
-        showdown(&boards, 0, 0, &[1], &[], &reach, 100.0, 10.0, &mut hu, &mut scratch);
-        showdown(&boards, 0, 0, &[1], &[2], &reach, 100.0, 10.0, &mut with_folded, &mut scratch);
+        showdown(&boards, 0, 0, &[1], &[], &reach, 100.0, 10.0, &mut hu);
+        showdown(&boards, 0, 0, &[1], &[2], &reach, 100.0, 10.0, &mut with_folded);
         // Whatever seat 1 holds, seat 2 holds any two of the 43 cards left: C(43, 2) = 903.
         for h in 0..NUM_COMBOS {
             if boards[0].valid(h) {

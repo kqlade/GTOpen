@@ -102,7 +102,9 @@ timing.
 ## API
 
 `POST /api/multiway-flop/solve` (synchronous and stateless; the caller sets
-its own timeout, and several can run at once, one thread each):
+its own timeout. The showdowns, nearly all of a solve's work, are evaluated
+across the cores (rayon, one runout per task), so one solve uses the whole
+machine and concurrent solves share it):
 
 ```json
 {"board": "Ks7h2d",
@@ -159,8 +161,9 @@ price equity per hand. A seat that has folded shows no hands. Reading costs a
 few traversals of the subtree per node, a small share of a real solve.
 
 On the 6-max baseline's BTN-SB-BB single-raised pot the one-street tree (two
-bet sizes, one raise size, two raises, 40 runouts) is 370 nodes and reaches a
-0.5% gap in 75 iterations, about 40 s on one core; with the turn street above
+bet sizes, one raise size, two raises, 24 runouts) is 370 nodes; a solve's
+time is linear in the runouts, and on a ten-core laptop 20 iterations take
+5 s against 20 s on one core (48 runouts: 9 s). With the turn street above
 (six turn cards, eight rivers, one turn size and raise) a flop is 25k nodes
 and an iteration takes about 24 s on one core.
 
